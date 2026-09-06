@@ -15,8 +15,8 @@ Shared vocabulary, per the orchestrator:
   unrealized R on the *remaining* quantity, not the trade's original size — intentionally:
   once a partial has scaled out, the question the time stop asks is whether the runner
   itself is working, not whether the trade as a whole has been profitable.
-- The time stop (close at market after `time_stop_bars` 4H bars if unrealized profit is
-  under `time_stop_min_r` R) is identical across all 16 variants, so it lives once in
+- The time stop (close at market after `time_stop_bars` 4H bars if the trade is still
+  within ±`time_stop_min_r` R of entry, a symmetric dead band) is identical across all 16 variants, so it lives once in
   `_ExitRuleBase.on_bar`, which every rule inherits; a rule's own per-bar logic goes in
   `_manage`, called only when the time stop does not fire. `on_bar`'s time-stop check runs
   first and, when it fires, returns *only* the market order for that bar — never alongside
