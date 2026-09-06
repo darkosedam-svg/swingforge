@@ -117,3 +117,14 @@ def test_in_memory_reader_bumps_the_version_on_every_set() -> None:
 
 def test_in_memory_reader_satisfies_the_protocol() -> None:
     assert isinstance(InMemorySettingsReader(), SettingsReader)
+
+
+def test_settings_rejects_unknown_fields() -> None:
+    """A typo such as ``kill_swtich`` must fail loudly, never silently return defaults."""
+    import pytest
+    from pydantic import ValidationError
+
+    from swingforge.core.settings import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(kill_swtich=True)  # type: ignore[call-arg]

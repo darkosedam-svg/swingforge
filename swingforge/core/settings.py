@@ -33,7 +33,7 @@ class Settings(BaseModel):
     it.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     risk_pct: float = Field(0.01, gt=0, le=0.02)
     enabled_instruments: dict[str, tuple[str, ...]] = Field(default_factory=dict)
