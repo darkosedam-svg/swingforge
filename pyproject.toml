@@ -51,6 +51,7 @@ filterwarnings = [
     "default::PendingDeprecationWarning",
     "default::ResourceWarning",
     "default::RuntimeWarning",
+    "default::SyntaxWarning",
 ]
 
 [tool.mypy]
