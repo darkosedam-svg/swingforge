@@ -80,8 +80,8 @@ def fill(**overrides: object) -> Fill:
     return Fill(**kwargs)  # type: ignore[arg-type]
 
 
-def test_contract_version_is_one() -> None:
-    assert CONTRACT_VERSION == 1
+def test_contract_version_is_two() -> None:
+    assert CONTRACT_VERSION == 2
 
 
 # --- Signal ----------------------------------------------------------------

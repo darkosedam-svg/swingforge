@@ -133,6 +133,9 @@ class StubStrategy:
 class StubExitRule:
     name = "stub_exit"
 
+    def initial_stop(self, signal: Signal, ctx: Context) -> float:
+        return signal.stop
+
     def attach(self, trade: Trade, ctx: Context) -> list[Order]:
         return [
             Order(

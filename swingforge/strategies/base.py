@@ -5,7 +5,8 @@ One bar, start to finish::
     Engine
       -> Strategy.on_bar(ctx)              # flat and not killed: may return a Signal
       -> Signal
-      -> Portfolio sizes it into Order(leg="entry")
+      -> ExitRule.initial_stop(signal, ctx)  # the stop the engine sizes against
+      -> Portfolio sizes it into Order(leg="entry", trade_id=<new trade id>)
       -> Broker.submit(order)
       -> Fill(leg="entry")                 # on a later bar, when the entry actually fills
       -> Engine builds the Trade
@@ -70,6 +71,15 @@ class ExitRule(Protocol):
 
     name: str
     """Stable identifier used in config ids and result rows."""
+
+    def initial_stop(self, signal: Signal, ctx: Context) -> float:
+        """The stop this rule will use for a trade entered on `signal`, before the fill.
+
+        The engine sizes the position from this level, so a rule that overrides the
+        signal's stop (`ATRFixedR`) must return the overridden level here and use the
+        same level in `attach`. Every other rule returns `signal.stop`.
+        """
+        ...
 
     def attach(self, trade: Trade, ctx: Context) -> list[Order]:
         """Build the initial exit legs, called once immediately after the entry fill.

@@ -211,8 +211,11 @@ class Order(BaseModel):
     ``leg`` says what the order is for: the entry, or one of the exit legs an
     :class:`~swingforge.strategies.base.ExitRule` attaches to a trade. ``trade_id`` groups
     the exit legs of one trade so a broker can replace a pending leg (same ``trade_id`` and
-    ``leg``) when a rule updates it; it is ``None`` on an entry order, whose trade does not
-    exist yet.
+    ``leg``) when a rule updates it. The engine assigns the trade id when it submits the
+    entry order, so an entry carries ``trade_id`` too (its ``(trade_id, "entry")`` key is
+    unique, hence never a replacement) and the broker can attribute the entry fill to the
+    trade — it needs the entry price to apply the breakeven stop after a partial fill.
+    Only orders created outside the engine may leave ``trade_id`` as ``None``.
     """
 
     model_config = ConfigDict(frozen=True)
