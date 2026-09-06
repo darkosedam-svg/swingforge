@@ -331,6 +331,62 @@ def test_persist_bar_writes_fills_open_trade_and_equity(tmp_path) -> None:
     assert equity == [(TS0, 10_000.0)]
 
 
+def test_persist_bar_rolls_back_the_whole_bar_on_a_failed_write(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3: `_persist_bar`'s fills/trades/equity writes for one bar run inside a single
+    transaction, so a kill (or any failure) between writes can never leave a trade row
+    without its matching equity row -- simulated here by a `write_equity` that raises once.
+    The failed bar's writes all roll back together; a retry of the same bar lands them all.
+    """
+    store_path = tmp_path / "v.duckdb"
+    store = Store(store_path)
+    store.upsert_instruments([BTC])
+    store.close()
+
+    fill = Fill(order_id="o1", ts=TS0, price=100.0, qty=1.0, cost=CostBreakdown(), leg="entry", trade_id="t1")
+    open_trade = Trade(
+        id="t1",
+        instrument=BTC,
+        direction=1,
+        entry_fill=fill,
+        stop=95.0,
+        target=None,
+        risk_r=5.0,
+        opened_bar=0,
+    )
+
+    real_write_equity = Store.write_equity
+    calls = {"n": 0}
+
+    def flaky_write_equity(self, run_id, rows):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated failure between writes")
+        return real_write_equity(self, run_id, rows)
+
+    monkeypatch.setattr(Store, "write_equity", flaky_write_equity)
+
+    with pytest.raises(RuntimeError, match="simulated failure between writes"):
+        cli._persist_bar(store_path, "run1", [fill], open_trade, [], (TS0, 10_000.0))
+
+    store = Store(store_path, read_only=True)
+    trades_after_failure = store.trades("run1")
+    equity_after_failure = store.equity("run1")
+    store.close()
+    assert trades_after_failure == []  # rolled back together with the failed equity write
+    assert equity_after_failure == []
+
+    cli._persist_bar(store_path, "run1", [fill], open_trade, [], (TS0, 10_000.0))
+
+    store = Store(store_path, read_only=True)
+    trades_after_retry = store.trades("run1")
+    equity_after_retry = store.equity("run1")
+    store.close()
+    assert len(trades_after_retry) == 1
+    assert equity_after_retry == [(TS0, 10_000.0)]
+
+
 # --- venue wiring: _bar_source / _instruments / _funding / _build_cost_model --------
 
 
@@ -1111,6 +1167,50 @@ def test_paper_never_holds_the_store_open_between_bars(monkeypatch: pytest.Monke
     assert counters["opens"] == counters["closes"]  # balanced at the very end too
 
 
+def test_paper_no_phantom_equity_row_on_a_zero_bar_run(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """C4: when the stream raises before yielding a single bar, the `finally`-block flush
+    must not write an equity row -- the `equity` table is `Engine`'s persistent bar clock
+    (C1), so a phantom row here would silently advance it even though nothing happened.
+    Restarting against the same run id (still zero bars processed) must leave that clock
+    exactly where it was."""
+    data_dir, store_path = _seeded_instrument_store(tmp_path)
+
+    class _RaisesBeforeAnyBarSource:
+        def history(self, instrument, tf, start, end):  # type: ignore[no-untyped-def]
+            return []
+
+        async def stream(self, instrument, tf):  # type: ignore[no-untyped-def]
+            raise RuntimeError("venue exploded before first bar")
+            yield  # pragma: no cover -- unreachable; makes this an async generator
+
+    monkeypatch.setattr(cli, "_bar_source", lambda venue, **kw: _RaisesBeforeAnyBarSource())
+    monkeypatch.setattr(
+        cli, "_entry_factory", lambda name, instrument, *, baseline_rate, seed: _NeverSignals()
+    )
+
+    config_id = "none_signal|fixed_r_2|none|hyperliquid:BTC"
+    run_id = f"paper:hyperliquid:{config_id}"
+    args = ["paper", "--venue", "hyperliquid", "--config", config_id, "--data-dir", str(data_dir)]
+
+    first = runner.invoke(app, args)
+    assert first.exit_code == 1
+    assert "error: venue exploded before first bar" in first.output
+
+    store = Store(store_path, read_only=True)
+    equity_after_first = store.equity(run_id)
+    store.close()
+    assert equity_after_first == []
+
+    second = runner.invoke(app, args)  # a restart against the same (still bar-less) run id
+    assert second.exit_code == 1
+
+    store = Store(store_path, read_only=True)
+    equity_after_second = store.equity(run_id)
+    store.close()
+    assert equity_after_second == []
+    assert len(equity_after_second) == len(equity_after_first)  # bar clock unchanged
+
+
 def test_transient_settings_reader_used_by_paper_sees_a_live_kill_switch(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -1302,12 +1402,36 @@ def test_paper_keyboard_interrupt_stops_cleanly_after_a_final_flush(
         cli, "_entry_factory", lambda name, instrument, *, baseline_rate, seed: _NeverSignals()
     )
 
+    close_calls = {"n": 0}
+    real_close = PaperBroker.close
+
+    def counting_close(self):  # type: ignore[no-untyped-def]
+        close_calls["n"] += 1
+        return real_close(self)
+
+    monkeypatch.setattr(PaperBroker, "close", counting_close)
+
+    persist_calls = {"n": 0}
+    real_persist_bar = cli._persist_bar
+
+    def counting_persist_bar(*a, **kw):  # type: ignore[no-untyped-def]
+        persist_calls["n"] += 1
+        return real_persist_bar(*a, **kw)
+
+    monkeypatch.setattr(cli, "_persist_bar", counting_persist_bar)
+
     config_id = "none_signal|fixed_r_2|none|hyperliquid:BTC"
     result = runner.invoke(
         app, ["paper", "--venue", "hyperliquid", "--config", config_id, "--data-dir", str(data_dir)]
     )
     assert result.exit_code == 0, result.output
     assert "paper trading stopped" in result.output
+
+    # Pins the docstring's "final flush + close()" claim: `broker.close()` runs exactly
+    # once, and `_persist_bar` runs exactly twice -- once for the one bar processed in the
+    # loop, once more for the `finally`-block flush.
+    assert close_calls["n"] == 1
+    assert persist_calls["n"] == 2
 
     run_id = f"paper:hyperliquid:{config_id}"
     store = Store(store_path, read_only=True)

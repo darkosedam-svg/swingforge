@@ -556,34 +556,59 @@ def _persist_bar(
     fills: Sequence[Fill],
     open_trade: Trade | None,
     closed_trades: Sequence[Trade],
-    equity_point: tuple[datetime, float],
+    equity_point: tuple[datetime, float] | None,
     *,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Open the store once, write this bar's fills/trades/equity, and close it.
+    """Open the store once, write this bar's fills/trades/equity in one transaction, and close it.
 
     ⚠ The open trade (if any) is written every bar as a provisional row -- `closed_bar` and
     `realized_r` both `None` -- and is upserted in place with its final values the bar it
     closes on (the dashboard's own convention: same `id`, same primary key).
 
+    `equity_point` is `None` for the zero-bar case (the `finally`-block flush after a stream
+    that never yielded a bar): the `equity` table is `Engine`'s persistent monotonic bar
+    clock (C1), so writing a point here with nothing to back it would silently advance that
+    clock. With every argument empty/`None` (nothing to write at all) this returns without
+    even opening the store.
+
+    C3: the three writes run inside one DuckDB transaction (`BEGIN`/`COMMIT`, `ROLLBACK` on
+    any failure) so a kill (or any exception) between them can never leave a trade row
+    without its matching equity row -- that window could otherwise reuse a trade id after
+    `--abandon-open-trade`.
+
     I6: the nightly incremental backfill (WU-1A/1B) holds a venue's store file open for a
     few minutes; landing in that window raises `duckdb.IOException` (file locked) rather
-    than blocking. Retried up to `PERSIST_RETRIES` times, `PERSIST_BACKOFF_S` seconds apart
-    (~5 minutes total) before giving up -- paper trading is meant to wait that lock out, not
-    die to it. `sleep` is injectable so a test can pin this down without actually waiting.
+    than blocking. The whole transaction above is retried up to `PERSIST_RETRIES` times,
+    `PERSIST_BACKOFF_S` seconds apart (~5 minutes total) before giving up -- paper trading is
+    meant to wait that lock out, not die to it. `sleep` is injectable so a test can pin this
+    down without actually waiting.
     """
+    if not fills and open_trade is None and not closed_trades and equity_point is None:
+        return
     attempt = 0
     while True:
         try:
             with Store(store_path) as store:
-                if fills:
-                    store.write_fills(run_id, fills)
-                trades = [*closed_trades]
-                if open_trade is not None:
-                    trades.append(open_trade)
-                if trades:
-                    store.write_trades(run_id, trades)
-                store.write_equity(run_id, [equity_point])
+                # `Store` has no public transaction helper (only `write_settings` reaches
+                # for `begin`/`commit`/`rollback` internally) -- `store._conn` directly, as
+                # `swingforge/web/queries.py` already does for read-only access.
+                store._conn.begin()
+                try:
+                    if fills:
+                        store.write_fills(run_id, fills)
+                    trades = [*closed_trades]
+                    if open_trade is not None:
+                        trades.append(open_trade)
+                    if trades:
+                        store.write_trades(run_id, trades)
+                    if equity_point is not None:
+                        store.write_equity(run_id, [equity_point])
+                except Exception:
+                    store._conn.rollback()
+                    raise
+                else:
+                    store._conn.commit()
             return
         except duckdb.IOException:
             attempt += 1
@@ -686,6 +711,7 @@ async def _paper(
     runtime = await _build_paper_runtime(venue, config_id, poll_delay, data_dir, abandon_open_trade)
     log_cursor: FillLog | None = None
     last_bar_close = datetime.now(UTC)
+    bars_seen = 0
     try:
         async for bar in runtime.source.stream(runtime.instrument, "4h"):
             if bar.ts_open.hour == 0:
@@ -699,6 +725,7 @@ async def _paper(
                 typer.echo(f"kill switch {state}")
             fills, log_cursor = _drain_fill_log(runtime.broker, log_cursor)
             last_bar_close = bar.ts_open + _FOUR_HOURS
+            bars_seen += 1
             equity_point = (last_bar_close, runtime.portfolio.equity)
             _persist_bar(
                 runtime.store_path, runtime.run_id, fills, runtime.engine.open_trade, closed, equity_point
@@ -718,13 +745,18 @@ async def _paper(
         try:
             runtime.broker.close()
             fills, log_cursor = _drain_fill_log(runtime.broker, log_cursor)
+            # C4: no bar was ever processed (the stream ended/raised before yielding one) --
+            # `equity` is `Engine`'s persistent bar clock (C1), so this flush must not write
+            # a point for it; `_persist_bar` then no-ops entirely when there is nothing else
+            # to write either.
+            final_equity_point = (last_bar_close, runtime.portfolio.equity) if bars_seen else None
             _persist_bar(
                 runtime.store_path,
                 runtime.run_id,
                 fills,
                 runtime.engine.open_trade,
                 [],
-                (last_bar_close, runtime.portfolio.equity),
+                final_equity_point,
             )
         except Exception as flush_exc:
             typer.echo(f"error during final flush: {flush_exc}", err=True)
