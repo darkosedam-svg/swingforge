@@ -245,7 +245,13 @@ class ICT:
 
     def _update_swing_levels(self, ctx: Context) -> None:
         """Extend `_swing_highs_cache`/`_swing_lows_cache` by whatever newly became
-        confirmable since the last update - see the module docstring."""
+        confirmable since the last update - see the module docstring.
+
+        The cache is append-only: a pivot stays available after its Daily bar has been
+        trimmed out of the `Context` window, so under a small `max_bars` the liquidity
+        range and `structure_target` may anchor on a level a from-scratch scan of the
+        retained bars would no longer see. Unreachable at the default `max_bars`.
+        """
         history = ctx.history("1d")
         if not history:
             return
