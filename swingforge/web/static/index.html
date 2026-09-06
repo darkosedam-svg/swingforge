@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>swingforge dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --muted: #9aa1ac;
+    --green: #3ecf8e;
+    --red: #e5534b;
+    --amber: #d9a441;
+    --accent: #5b8def;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  nav { display: flex; gap: 4px; }
+  nav button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  nav button.active { color: var(--text); border-color: var(--accent); background: #1b2130; }
+  .token-box { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .token-box input { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 6px; width: 220px; }
+  main { padding: 16px; display: flex; flex-direction: column; gap: 20px; }
+  section.view { display: none; flex-direction: column; gap: 16px; }
+  section.view.active { display: flex; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .venue-block { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+  .venue-block > h3 { margin: 0; font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.fresh { background: rgba(62,207,142,0.15); color: var(--green); }
+  .badge.stale { background: rgba(229,83,75,0.15); color: var(--red); }
+  .check-yes { color: var(--green); }
+  .check-no { color: var(--red); }
+  .muted { color: var(--muted); }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .row > .card { flex: 1 1 320px; }
+  form.settings-form { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; max-width: 480px; }
+  form.settings-form input[type="text"], form.settings-form input[type="number"], form.settings-form select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 6px;
+  }
+  form.settings-form button { grid-column: 1 / -1; margin-top: 6px; padding: 8px; border-radius: 6px; border: none; background: var(--accent); color: white; cursor: pointer; }
+  .trade-inputs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .trade-inputs input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; flex: 1; }
+  .trade-inputs button { padding: 6px 14px; border-radius: 6px; border: none; background: var(--accent); color: white; cursor: pointer; }
+  .status-line { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  svg.chart { width: 100%; height: 160px; display: block; }
+  svg.chart .axis { stroke: var(--border); stroke-width: 1; }
+  svg.chart .series { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+  svg.chart .stop-line { stroke: var(--red); stroke-dasharray: 4 3; stroke-width: 1; }
+  svg.chart .target-line { stroke: var(--green); stroke-dasharray: 4 3; stroke-width: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>swingforge</h1>
+  <nav>
+    <button data-view="overview" class="active">Overview</button>
+    <button data-view="tournament">Tournament</button>
+    <button data-view="trade">Trade</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+  <div class="token-box">
+    <label for="token" class="muted">token</label>
+    <input id="token" type="text" placeholder="bearer token (optional)" />
+  </div>
+</header>
+
+<main>
+
+<section class="view active" id="view-overview">
+  <div class="card">
+    <h2>Overview <span id="overview-generated" class="muted"></span></h2>
+    <div id="overview-body">Loading&hellip;</div>
+  </div>
+</section>
+
+<section class="view" id="view-tournament">
+  <div class="card">
+    <h2>Latest tournament</h2>
+    <div id="tournament-body">Loading&hellip;</div>
+  </div>
+</section>
+
+<section class="view" id="view-trade">
+  <div class="card">
+    <h2>Trade detail</h2>
+    <div class="trade-inputs">
+      <input id="trade-run-id" type="text" placeholder="run_id" />
+      <input id="trade-id" type="text" placeholder="trade_id" />
+      <button id="trade-fetch">Load</button>
+    </div>
+    <div id="trade-body" class="muted">Enter a run_id and trade_id.</div>
+  </div>
+</section>
+
+<section class="view" id="view-settings">
+  <div class="card">
+    <h2>Settings</h2>
+    <div id="settings-body">Loading&hellip;</div>
+  </div>
+</section>
+
+</main>
+
+<script>
+"use strict";
+
+const state = { pollTimer: null, activeView: "overview" };
+
+function authHeaders() {
+  const token = document.getElementById("token").value.trim();
+  return token ? { "Authorization": "Bearer " + token } : {};
+}
+
+function loadToken() {
+  try {
+    const saved = localStorage.getItem("swingforge_token");
+    if (saved) document.getElementById("token").value = saved;
+  } catch (e) { /* private-browsing storage access can throw; ignore */ }
+}
+
+function saveToken() {
+  try {
+    localStorage.setItem("swingforge_token", document.getElementById("token").value.trim());
+  } catch (e) { /* ignore */ }
+}
+
+async function api(path, options) {
+  const resp = await fetch(path, Object.assign({}, options, {
+    headers: Object.assign({}, (options && options.headers) || {}, authHeaders()),
+  }));
+  let body = null;
+  try { body = await resp.json(); } catch (e) { /* no body */ }
+  if (!resp.ok) {
+    const detail = body && body.detail ? body.detail : resp.statusText;
+    throw new Error(resp.status + ": " + detail);
+  }
+  return body;
+}
+
+function esc(value) {
+  return String(value === null || value === undefined ? "" : value).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function fmt(value, digits) {
+  if (value === null || value === undefined) return "&mdash;";
+  if (typeof value !== "number") return esc(value);
+  return value.toFixed(digits === undefined ? 2 : digits);
+}
+
+function rWithColor(value) {
+  if (value === null || value === undefined) return '<span class="muted">&mdash;</span>';
+  const cls = value >= 0 ? "pos" : "neg";
+  return `<span class="${cls}">${fmt(value, 3)}</span>`;
+}
+
+function check(value) {
+  if (value === null || value === undefined) return '<span class="muted">&ndash;</span>';
+  return value ? '<span class="check-yes">&#10003;</span>' : '<span class="check-no">&#10007;</span>';
+}
+
+// -- a tiny dependency-free inline-SVG line chart (see handoff: no chart library, by design) --
+function lineChartSvg(points, opts) {
+  opts = opts || {};
+  const w = 640, h = 150, pad = 24;
+  if (!points.length) return '<div class="muted">no data</div>';
+  const xs = points.map((p) => p[0]);
+  const ys = points.map((p) => p[1]);
+  const extraYs = (opts.extraLines || []).map((l) => l.value);
+  const yMin = Math.min(...ys, ...extraYs);
+  const yMax = Math.max(...ys, ...extraYs);
+  const xMin = Math.min(...xs);
+  const xMax = Math.max(...xs);
+  const xSpan = xMax - xMin || 1;
+  const ySpan = yMax - yMin || 1;
+  const sx = (x) => pad + ((x - xMin) / xSpan) * (w - 2 * pad);
+  const sy = (y) => h - pad - ((y - yMin) / ySpan) * (h - 2 * pad);
+  const path = points.map((p, i) => (i === 0 ? "M" : "L") + sx(p[0]).toFixed(1) + "," + sy(p[1]).toFixed(1)).join(" ");
+  let extra = "";
+  for (const line of (opts.extraLines || [])) {
+    const y = sy(line.value).toFixed(1);
+    extra += `<line class="${line.cls}" x1="${pad}" y1="${y}" x2="${w - pad}" y2="${y}" />`;
+    extra += `<text x="${w - pad}" y="${y}" fill="var(--muted)" font-size="10" text-anchor="end" dy="-2">${esc(line.label)}</text>`;
+  }
+  return `<svg class="chart" viewBox="0 0 ${w} ${h}">
+    <line class="axis" x1="${pad}" y1="${h - pad}" x2="${w - pad}" y2="${h - pad}" />
+    <line class="axis" x1="${pad}" y1="${pad}" x2="${pad}" y2="${h - pad}" />
+    ${extra}
+    <path class="series" d="${path}" />
+  </svg>`;
+}
+
+// -- views ---------------------------------------------------------------
+
+// Poll only while the Overview tab is the one showing and the page itself is visible --
+// otherwise a hidden/backgrounded tab (or a tab parked on Tournament/Trade/Settings) would
+// keep hitting /api/overview every 10s forever for no one to see.
+function updatePolling() {
+  const shouldPoll = state.activeView === "overview" && !document.hidden;
+  if (shouldPoll && !state.pollTimer) {
+    loadOverview();
+    state.pollTimer = setInterval(loadOverview, 10000);
+  } else if (!shouldPoll && state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+document.addEventListener("visibilitychange", updatePolling);
+
+function reloadActiveView() {
+  if (state.activeView === "overview") loadOverview();
+  else if (state.activeView === "tournament") loadTournament();
+  else if (state.activeView === "settings") loadSettings();
+  // the Trade view is fetched on demand (its own Load button), nothing to auto-reload there.
+}
+
+document.querySelectorAll("nav button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll("section.view").forEach((s) => s.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("view-" + btn.dataset.view).classList.add("active");
+    state.activeView = btn.dataset.view;
+    if (btn.dataset.view === "tournament") loadTournament();
+    if (btn.dataset.view === "settings") loadSettings();
+    updatePolling();
+  });
+});
+
+document.getElementById("token").addEventListener("change", () => {
+  saveToken();
+  reloadActiveView();
+});
+
+// -- overview --------------------------------------------------------------
+
+function renderOverview(data) {
+  document.getElementById("overview-generated").textContent = "generated " + data.generated_at;
+  const venues = Object.keys(data.venues);
+  if (!venues.length) {
+    document.getElementById("overview-body").innerHTML = '<div class="muted">no venue data files found</div>';
+    return;
+  }
+  let html = "";
+  for (const venue of venues) {
+    const v = data.venues[venue];
+    html += `<div class="venue-block"><h3>${esc(venue)}</h3>`;
+
+    // equity, one mini chart per run id
+    const runIds = Object.keys(v.equity);
+    if (runIds.length) {
+      html += '<div class="row">';
+      for (const runId of runIds) {
+        const points = v.equity[runId].map((p, i) => [i, p[1]]);
+        html += `<div class="card"><div class="muted">${esc(runId)}</div>${lineChartSvg(points)}</div>`;
+      }
+      html += "</div>";
+    } else {
+      html += '<div class="muted">no paper equity yet</div>';
+    }
+
+    // positions
+    html += "<table><thead><tr><th>run</th><th>symbol</th><th>dir</th><th>entry</th><th>qty</th>"
+      + "<th>stop</th><th>target</th><th>unrealized R</th><th>opened</th></tr></thead><tbody>";
+    for (const p of v.positions) {
+      html += `<tr><td>${esc(p.run_id)}</td><td>${esc(p.symbol)}</td><td>${p.direction > 0 ? "long" : "short"}</td>`
+        + `<td>${fmt(p.entry_price)}</td><td>${fmt(p.qty)}</td><td>${fmt(p.stop)}</td><td>${fmt(p.target)}</td>`
+        + `<td>${rWithColor(p.unrealized_r)}</td><td>${esc(p.opened_at)}</td></tr>`;
+    }
+    if (!v.positions.length) html += '<tr><td colspan="9" class="muted">no open positions</td></tr>';
+    html += "</tbody></table>";
+
+    // fills
+    html += "<table><thead><tr><th>run</th><th>ts</th><th>leg</th><th>price</th><th>qty</th><th>cost</th></tr></thead><tbody>";
+    for (const f of v.fills) {
+      html += `<tr><td>${esc(f.run_id)}</td><td>${esc(f.ts)}</td><td>${esc(f.leg)}</td>`
+        + `<td>${fmt(f.price)}</td><td>${fmt(f.qty)}</td><td>${fmt(f.cost_total, 4)}</td></tr>`;
+    }
+    if (!v.fills.length) html += '<tr><td colspan="6" class="muted">no fills yet</td></tr>';
+    html += "</tbody></table>";
+
+    // staleness
+    html += '<div class="row">';
+    for (const s of v.staleness) {
+      html += `<span class="badge ${s.stale ? "stale" : "fresh"}">${esc(s.symbol)}: ${s.bars_behind} bars behind</span>`;
+    }
+    if (!v.staleness.length) html += '<span class="muted">no bar data yet</span>';
+    html += "</div></div>";
+  }
+  document.getElementById("overview-body").innerHTML = html;
+}
+
+async function loadOverview() {
+  try {
+    const data = await api("/api/overview");
+    renderOverview(data);
+  } catch (e) {
+    document.getElementById("overview-body").innerHTML = `<div class="neg">${esc(e.message)}</div>`;
+  }
+}
+
+// -- tournament --------------------------------------------------------------
+
+function gateRow(r) {
+  return `<tr><td>${esc(r.config_id)}</td><td>${esc(r.entry)}/${esc(r.exit)}</td><td>${esc(r.symbol)}</td>`
+    + `<td>${check(r.g1)}</td><td>${check(r.g2)}</td><td>${check(r.g3)}</td><td>${check(r.g4)}</td>`
+    + `<td>${check(r.g5)}</td><td>${check(r.g6)}</td><td>${check(r.passed)}</td>`
+    + `<td>${fmt(r.exp_oos, 3)}</td></tr>`;
+}
+
+function renderTournament(data) {
+  if (data === null) {
+    document.getElementById("tournament-body").innerHTML = '<div class="muted">no tournament results yet</div>';
+    return;
+  }
+  let html = `<div class="muted">run ${esc(data.run_id)} &middot; ${esc(data.ts)}</div>`;
+
+  html += "<h3>Gate</h3><table><thead><tr><th>config</th><th>entry/exit</th><th>symbol</th>"
+    + "<th>g1</th><th>g2</th><th>g3</th><th>g4</th><th>g5</th><th>g6</th><th>passed</th><th>exp_oos</th></tr></thead><tbody>";
+  html += data.gate.map(gateRow).join("") || '<tr><td colspan="11" class="muted">none</td></tr>';
+  html += "</tbody></table>";
+
+  html += "<h3>Top configs (IS vs OOS)</h3><table><thead><tr><th>config</th><th>exp_is</th><th>exp_oos</th></tr></thead><tbody>";
+  html += data.top.map((r) => `<tr><td>${esc(r.config_id)}</td><td>${fmt(r.exp_is, 3)}</td><td>${fmt(r.exp_oos, 3)}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="muted">none</td></tr>';
+  html += "</tbody></table>";
+
+  html += '<div class="row">';
+  html += '<div class="card"><h2>IS-selected</h2><table><thead><tr><th>config</th><th>exp_oos</th></tr></thead><tbody>';
+  html += data.selected.map((r) => `<tr><td>${esc(r.config_id)}</td><td>${fmt(r.exp_oos, 3)}</td></tr>`).join("")
+    || '<tr><td colspan="2" class="muted">none</td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<div class="card"><h2>Regime</h2><table><thead><tr><th>regime</th><th>n</th><th>expectancy</th></tr></thead><tbody>';
+  html += data.regime.map((r) => `<tr><td>${esc(r.regime)}</td><td>${r.n}</td><td>${rWithColor(r.expectancy)}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="muted">none</td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<div class="card"><h2>Cost stress</h2><table><thead><tr><th>config</th><th>exp_oos</th><th>g6</th></tr></thead><tbody>';
+  html += data.cost_stress.map((r) => `<tr><td>${esc(r.config_id)}</td><td>${fmt(r.exp_oos, 3)}</td><td>${check(r.g6)}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="muted">none</td></tr>';
+  html += '</tbody></table></div>';
+  html += "</div>";
+
+  html += '<div class="card"><h2>Excluded</h2><table><thead><tr><th>config</th><th>reason</th></tr></thead><tbody>';
+  html += data.excluded.map((r) => `<tr><td>${esc(r.config_id)}</td><td>${esc(r.excluded_reason)}</td></tr>`).join("")
+    || '<tr><td colspan="2" class="muted">none</td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<div class="card"><h2>Resolution modes</h2><table><thead><tr><th>venue</th><th>symbol</th><th>mode</th></tr></thead><tbody>';
+  html += data.resolution_modes.map((r) => `<tr><td>${esc(r.venue)}</td><td>${esc(r.symbol)}</td><td>${esc(r.resolution_mode)}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="muted">none</td></tr>';
+  html += '</tbody></table></div>';
+
+  document.getElementById("tournament-body").innerHTML = html;
+}
+
+async function loadTournament() {
+  const el = document.getElementById("tournament-body");
+  el.innerHTML = "Loading&hellip;";
+  try {
+    const data = await api("/api/tournament/latest");
+    renderTournament(data);
+  } catch (e) {
+    if (String(e.message).startsWith("404")) {
+      renderTournament(null);
+    } else {
+      el.innerHTML = `<div class="neg">${esc(e.message)}</div>`;
+    }
+  }
+}
+
+// -- trade ------------------------------------------------------------------
+
+function renderTrade(data) {
+  let html = `<div class="row"><div class="card"><table>`
+    + `<tr><th>symbol</th><td>${esc(data.venue)}/${esc(data.symbol)}</td></tr>`
+    + `<tr><th>direction</th><td>${data.direction > 0 ? "long" : "short"}</td></tr>`
+    + `<tr><th>entry</th><td>${fmt(data.entry_price)} @ ${esc(data.entry_ts)}</td></tr>`
+    + `<tr><th>stop / target</th><td>${fmt(data.stop)} / ${fmt(data.target)}</td></tr>`
+    + `<tr><th>MAE / MFE (R)</th><td>${fmt(data.mae_r, 3)} / ${fmt(data.mfe_r, 3)}</td></tr>`
+    + `<tr><th>realized R</th><td>${rWithColor(data.realized_r)}</td></tr>`
+    + `<tr><th>regime</th><td>${esc(data.regime)}</td></tr>`
+    + `</table></div></div>`;
+
+  const points = data.bars.map((b, i) => [i, b.close]);
+  html += lineChartSvg(points, {
+    extraLines: [
+      { value: data.stop, cls: "stop-line", label: "stop " + fmt(data.stop) },
+      ...(data.target !== null && data.target !== undefined
+        ? [{ value: data.target, cls: "target-line", label: "target " + fmt(data.target) }]
+        : []),
+    ],
+  });
+
+  html += "<table><thead><tr><th>ts</th><th>open</th><th>high</th><th>low</th><th>close</th></tr></thead><tbody>";
+  html += data.bars.map((b) => `<tr><td>${esc(b.ts)}</td><td>${fmt(b.open)}</td><td>${fmt(b.high)}</td><td>${fmt(b.low)}</td><td>${fmt(b.close)}</td></tr>`).join("");
+  html += "</tbody></table>";
+
+  document.getElementById("trade-body").innerHTML = html;
+}
+
+document.getElementById("trade-fetch").addEventListener("click", async () => {
+  const runId = document.getElementById("trade-run-id").value.trim();
+  const tradeId = document.getElementById("trade-id").value.trim();
+  const el = document.getElementById("trade-body");
+  if (!runId || !tradeId) {
+    el.innerHTML = '<div class="muted">enter a run_id and trade_id</div>';
+    return;
+  }
+  el.innerHTML = "Loading&hellip;";
+  try {
+    const data = await api(`/api/trades/${encodeURIComponent(runId)}/${encodeURIComponent(tradeId)}`);
+    renderTrade(data);
+  } catch (e) {
+    el.innerHTML = `<div class="neg">${esc(e.message)}</div>`;
+  }
+});
+
+// -- settings --------------------------------------------------------------
+
+function settingsFormHtml(venue, settings) {
+  const enabled = JSON.stringify(settings.enabled_instruments || {});
+  const configs = (settings.paper_configs || []).join(",");
+  return `
+    <form class="settings-form" data-venue="${esc(venue)}">
+      <label>enabled_instruments (JSON)</label><input type="text" name="enabled_instruments" value='${esc(enabled)}' />
+      <label>paper_configs (comma-sep)</label><input type="text" name="paper_configs" value="${esc(configs)}" />
+      <label>risk_pct</label><input type="number" step="0.001" min="0" max="0.02" name="risk_pct" value="${esc(settings.risk_pct)}" />
+      <label>session</label>
+      <select name="session">
+        ${["none", "london_ny", "active"].map((v) => `<option value="${v}" ${v === settings.session ? "selected" : ""}>${v}</option>`).join("")}
+      </select>
+      <label>time_stop_bars</label><input type="number" min="1" step="1" name="time_stop_bars" value="${esc(settings.time_stop_bars)}" />
+      <label>kill_switch</label><input type="checkbox" name="kill_switch" ${settings.kill_switch ? "checked" : ""} />
+      <button type="submit">Save ${esc(venue)} settings</button>
+    </form>
+    <div class="status-line" id="settings-status-${esc(venue)}"></div>
+  `;
+}
+
+function renderSettings(data) {
+  const venues = Object.keys(data);
+  if (!venues.length) {
+    document.getElementById("settings-body").innerHTML = '<div class="muted">no venue data files found</div>';
+    return;
+  }
+  let html = "";
+  for (const venue of venues) {
+    html += `<div class="venue-block"><h3>${esc(venue)} <span class="muted">v${data[venue].version}</span></h3>`
+      + settingsFormHtml(venue, data[venue].settings) + "</div>";
+  }
+  document.getElementById("settings-body").innerHTML = html;
+
+  document.querySelectorAll("form.settings-form").forEach((form) => {
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const venue = form.dataset.venue;
+      const statusEl = document.getElementById("settings-status-" + venue);
+      const fd = new FormData(form);
+      let enabledInstruments = {};
+      try {
+        enabledInstruments = JSON.parse(fd.get("enabled_instruments") || "{}");
+      } catch (e) {
+        statusEl.textContent = "enabled_instruments must be valid JSON";
+        statusEl.className = "status-line neg";
+        return;
+      }
+      const body = {
+        venue,
+        settings: {
+          enabled_instruments: enabledInstruments,
+          paper_configs: (fd.get("paper_configs") || "").split(",").map((s) => s.trim()).filter(Boolean),
+          risk_pct: parseFloat(fd.get("risk_pct")),
+          session: fd.get("session"),
+          time_stop_bars: parseInt(fd.get("time_stop_bars"), 10),
+          kill_switch: form.querySelector('[name="kill_switch"]').checked,
+        },
+      };
+      try {
+        const resp = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        statusEl.textContent = `saved, version ${resp.version}`;
+        statusEl.className = "status-line pos";
+      } catch (e) {
+        statusEl.textContent = e.message;
+        statusEl.className = "status-line neg";
+      }
+    });
+  });
+}
+
+async function loadSettings() {
+  const el = document.getElementById("settings-body");
+  el.innerHTML = "Loading&hellip;";
+  try {
+    const data = await api("/api/settings");
+    renderSettings(data);
+  } catch (e) {
+    el.innerHTML = `<div class="neg">${esc(e.message)}</div>`;
+  }
+}
+
+// -- boot --------------------------------------------------------------
+
+loadToken();
+updatePolling();
+</script>
+</body>
+</html>
