@@ -69,12 +69,15 @@ forbidden_modules =
     oandapyV20
 
 [importlinter:contract:web-is-read-only]
-name = web reads lab, core and duckdb; no strategies, adapters or venue SDKs
+name = web reads lab, core, adapters.store and duckdb; nothing from strategies, venue/replay/paper adapters or SDKs
 type = forbidden
 source_modules =
     swingforge.web
 forbidden_modules =
     swingforge.strategies
-    swingforge.adapters
+    swingforge.adapters.hyperliquid
+    swingforge.adapters.oanda
+    swingforge.adapters.replay
+    swingforge.adapters.paper
     hyperliquid
     oandapyV20
