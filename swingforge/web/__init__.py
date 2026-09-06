@@ -1,0 +1,1 @@
+"""Read-mostly FastAPI dashboard."""

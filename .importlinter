@@ -1,0 +1,80 @@
+# Dependency rules for swingforge (design spec section 2), enforced on every commit by
+# tests/unit/test_contract_imports.py. `swingforge.cli` is deliberately outside the layers:
+# it is the composition root and may import anything.
+
+[importlinter]
+root_package = swingforge
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Package layers (web > lab > strategies | adapters > core)
+type = layers
+layers =
+    swingforge.web
+    swingforge.lab
+    swingforge.strategies | swingforge.adapters
+    swingforge.core
+
+[importlinter:contract:core-is-pure]
+name = core imports only stdlib, pydantic and numpy
+type = forbidden
+source_modules =
+    swingforge.core
+forbidden_modules =
+    duckdb
+    typer
+    fastapi
+    uvicorn
+    hyperliquid
+    oandapyV20
+    swingforge.adapters
+    swingforge.strategies
+    swingforge.lab
+    swingforge.web
+
+[importlinter:contract:strategies-see-core-only]
+name = strategies imports core only
+type = forbidden
+source_modules =
+    swingforge.strategies
+forbidden_modules =
+    duckdb
+    fastapi
+    hyperliquid
+    oandapyV20
+    swingforge.adapters
+    swingforge.lab
+    swingforge.web
+
+[importlinter:contract:adapters-own-the-venue-sdks]
+name = adapters is the only package importing venue SDKs
+type = forbidden
+source_modules =
+    swingforge.adapters
+forbidden_modules =
+    swingforge.strategies
+    swingforge.lab
+    swingforge.web
+
+[importlinter:contract:lab-uses-neutral-adapters-only]
+name = lab uses replay/paper/store adapters, never a venue
+type = forbidden
+source_modules =
+    swingforge.lab
+forbidden_modules =
+    swingforge.adapters.hyperliquid
+    swingforge.adapters.oanda
+    swingforge.web
+    hyperliquid
+    oandapyV20
+
+[importlinter:contract:web-is-read-only]
+name = web reads lab, core and duckdb; no strategies, adapters or venue SDKs
+type = forbidden
+source_modules =
+    swingforge.web
+forbidden_modules =
+    swingforge.strategies
+    swingforge.adapters
+    hyperliquid
+    oandapyV20
