@@ -13,6 +13,7 @@ dependencies = [
     "hyperliquid-python-sdk>=0.9",
     "oandapyV20>=0.7",
     "python-dotenv>=1.0",
+    "six>=1.17.0",
 ]
 
 [project.scripts]
