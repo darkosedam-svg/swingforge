@@ -102,14 +102,17 @@ def _pooled_rows(result: TournamentResult) -> list[dict[str, Any]]:
 def _shown_rows(pooled: Sequence[dict[str, Any]], top_n: int) -> tuple[list[dict[str, Any]], int]:
     """The pooled rows the per-config tables show, and how many that leaves out.
 
-    Every config that passed the gate, the `top_n` best by out-of-sample expectancy, and
-    every `IS_SELECTED` view — which is the walk-forward answer and belongs in the report
-    whatever it ranks. A config that never produced an expectancy (its replay failed) is
-    never shown: its row would be a line of en dashes, and the `Excluded` section names it
-    with its reason. `pooled`'s own order is kept, so the choice is deterministic.
+    Every config that passed the gate, the `top_n` best by out-of-sample expectancy among
+    the graded, non-view configs, and every `IS_SELECTED` view — which is the walk-forward
+    answer and belongs in the report whatever it ranks. `IS_SELECTED` rows are excluded from
+    the ranking itself (matching `_top_configs`) so a view never steals a top-N slot from a
+    config that would otherwise earn one; it is unioned in afterwards instead. A config that
+    never produced an expectancy (its replay failed) is never shown: its row would be a line
+    of en dashes, and the `Excluded` section names it with its reason. `pooled`'s own order
+    is kept, so the choice is deterministic.
     """
     graded = sorted(
-        (row for row in pooled if row["exp_oos"] is not None),
+        (row for row in pooled if row["exp_oos"] is not None and row["exit"] != _IS_SELECTED),
         key=lambda row: (-row["exp_oos"], row["config_id"]),
     )
     keep = {row["config_id"] for row in graded[:top_n]}
@@ -120,7 +123,10 @@ def _shown_rows(pooled: Sequence[dict[str, Any]], top_n: int) -> tuple[list[dict
 
 def _omitted_note(omitted: int) -> list[str]:
     """The line a truncated table carries, or nothing at all when nothing was hidden."""
-    return [] if omitted == 0 else [f"{omitted} rows omitted; the full set is in the `results` table.", ""]
+    if omitted == 0:
+        return []
+    noun = "row" if omitted == 1 else "rows"
+    return [f"{omitted} {noun} omitted; the full set is in the `results` table.", ""]
 
 
 def _stressed_expectancy(trades: Sequence[Trade]) -> float | None:

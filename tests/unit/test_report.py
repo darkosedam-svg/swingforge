@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -355,6 +356,23 @@ def test_the_large_tables_keep_the_top_configs_and_count_the_rest() -> None:
     assert _escaped(LOSER) not in text
 
 
+def test_a_dominant_view_does_not_steal_a_top_n_slot() -> None:
+    # WU-2C reviewer finding: `_shown_rows` used to rank the top_n including `IS_SELECTED`
+    # rows, while `_top_configs` ranks them out and appends the views afterwards. So a view
+    # ranked above every graded config could occupy the one top_n=1 slot and knock the best
+    # non-view config out of the gate/excursion/cost-stress tables, even though that config
+    # still won its rightful spot in the "Top N" table.
+    result = _result()
+    rows = tuple(
+        row if not (row["config_id"] == SELECTED and row["split"] == "pooled") else {**row, "exp_oos": 5.0}
+        for row in result.rows
+    )
+    dominant_view = replace(result, rows=rows)
+    text = report.render(dominant_view, top_n=1)
+    for heading in ("## Top 1 configs, IS vs OOS", "## Gate", "## Excursion", "## Cost stress"):
+        assert _escaped(RUINED) in "\n".join(_section(text, heading)), heading
+
+
 def test_a_passing_config_is_shown_however_it_ranks() -> None:
     # top_n=0 leaves only the two rules that are never subject to the cutoff
     body = _table_body(report.render(_result(), top_n=0), "## Gate")
@@ -363,7 +381,7 @@ def test_a_passing_config_is_shown_however_it_ranks() -> None:
 
 def test_only_the_ungraded_config_is_hidden_at_a_high_cutoff() -> None:
     text = report.render(_result(), top_n=99)
-    assert any("1 rows omitted" in line for line in _section(text, "## Gate"))
+    assert any("1 row omitted" in line for line in _section(text, "## Gate"))
 
 
 def test_gate_table_sorts_passing_configs_first() -> None:

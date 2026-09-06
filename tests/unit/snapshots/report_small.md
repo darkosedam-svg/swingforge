@@ -6,13 +6,14 @@ Written to be read. The complete record of this run is the `results` table — a
 
 2 config(s) could not be graded; their reason is in the last section.
 
-2 rows omitted; the full set is in the `results` table.
+1 row omitted; the full set is in the `results` table.
 
 | config | n_oos | exp_is | exp_oos | dsr prob | boot p5 | diff p5 | MAR | B&H MAR | 1 | 2 | 3 | 4 | 5 | 6 | passed |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | ict\|fixed_r_2\|none\|hyperliquid:BTC | 8 | 0.410 | 0.500 | 0.970 | 0.080 | 0.050 | ∞ | 0.750 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | zones\|trail_1_2\|none\|hyperliquid:BTC | 61 | 0.200 | 0.900 | – | – | – | – | – | – | – | – | – | – | – | – |
 | ict\|IS_SELECTED\|none\|hyperliquid:BTC | 4 | 0.300 | 0.375 | 0.420 | -0.040 | -0.110 | 1.400 | 0.750 | ✓ | ✗ | ✓ | ✗ | ✓ | – | ✗ |
+| baseline\|fixed_r_2\|none\|hyperliquid:BTC | 8 | -0.150 | -0.200 | 0.420 | -0.040 | -0.110 | 0.200 | 0.750 | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
 ## Top 3 configs, IS vs OOS
 
@@ -50,10 +51,11 @@ Diagnostic only: a trade appears once per config it belongs to, so counts are no
 Pooled out-of-sample trades per config. A `(raw signal)` row is the same entry
 held with no exit management, so it measures the entry rather than the exit.
 
-2 rows omitted; the full set is in the `results` table.
+1 row omitted; the full set is in the `results` table.
 
 | config | n | stopped out of winner | median exit eff. | median MAE (R) | median MFE (R) | MFE p75 (R) |
 |---|---|---|---|---|---|---|
+| baseline\|fixed_r_2\|none\|hyperliquid:BTC | 8 | 1.000 | – | 0.500 | 1.500 | 1.650 |
 | ict\|IS_SELECTED\|none\|hyperliquid:BTC | 4 | 1.000 | 0.969 | 0.450 | 1.500 | 1.650 |
 | ict\|fixed_r_2\|none\|hyperliquid:BTC | 8 | 1.000 | 0.969 | 0.500 | 1.500 | 1.650 |
 | zones\|trail_1_2\|none\|hyperliquid:BTC | 0 | – | – | – | – | – |
@@ -62,10 +64,11 @@ held with no exit management, so it measures the entry rather than the exit.
 
 Spread and slippage x2, funding x1.5, applied post hoc to the same fills (rule 6).
 
-2 rows omitted; the full set is in the `results` table.
+1 row omitted; the full set is in the `results` table.
 
 | config | exp_oos | stressed exp_oos | delta | rule 6 |
 |---|---|---|---|---|
+| baseline\|fixed_r_2\|none\|hyperliquid:BTC | -0.200 | -0.217 | -0.017 | ✗ |
 | ict\|IS_SELECTED\|none\|hyperliquid:BTC | 0.375 | 0.358 | -0.017 | – |
 | ict\|fixed_r_2\|none\|hyperliquid:BTC | 0.375 | 0.358 | -0.017 | ✓ |
 | zones\|trail_1_2\|none\|hyperliquid:BTC | – | – | – | – |
