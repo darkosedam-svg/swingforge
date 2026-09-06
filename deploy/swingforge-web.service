@@ -1,0 +1,29 @@
+[Unit]
+Description=swingforge dashboard (read-mostly web UI)
+Documentation=https://github.com/darkosedam-svg/swingforge/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=swingforge
+Group=swingforge
+WorkingDirectory=/opt/swingforge
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/swingforge
+EnvironmentFile=/etc/swingforge.env
+ExecStart=/opt/swingforge/.venv/bin/swingforge web --host 0.0.0.0 --port 8787
+
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/swingforge
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

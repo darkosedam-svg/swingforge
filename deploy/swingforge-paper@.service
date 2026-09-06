@@ -1,0 +1,61 @@
+[Unit]
+Description=swingforge paper trading (%i)
+Documentation=https://github.com/darkosedam-svg/swingforge/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=swingforge
+Group=swingforge
+WorkingDirectory=/opt/swingforge
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/swingforge
+Environment=INSTANCE=%i
+EnvironmentFile=/etc/swingforge.env
+
+# Instance name is "<venue>-<slug>" (e.g. "hyperliquid-btc-ict"); it cannot be the raw
+# CLI config id ("entry|exit|session|venue:symbol") because systemd instance names may
+# not contain "|" or ":". So the config id lives in a per-instance file instead, and this
+# unit reads it at start time. %i is passed through as $INSTANCE (below) rather than used
+# directly in the venue split, since %i is the *whole* instance name, not just the venue.
+#
+# ExecStart does not run under a shell by default, hence the explicit /bin/bash -c. Every
+# literal "$" and "%" below is doubled ("$$" / "%%") because systemd itself expands both
+# $VAR/${VAR} and %-specifiers in Exec* lines before bash ever sees the string; the escaped
+# form below is exactly the doubling of this single, unescaped script:
+#   VENUE="${INSTANCE%%-*}"
+#   CONF="$(cat "/etc/swingforge/paper/$INSTANCE.conf")"
+#   [[ -n "$CONF" ]] || { echo "empty config for instance $INSTANCE" >&2; exit 78; }
+#   exec /opt/swingforge/.venv/bin/swingforge paper --venue "$VENUE" --config "$CONF"
+# The explicit CONF/[[ -n ]] check (rather than passing `--config "$(cat ...)"` straight
+# through) turns an empty .conf file into a clear, distinct failure (exit 78; a missing file
+# already aborts on cat's exit status under set -e,
+# sysexits EX_CONFIG) instead of a confusing `swingforge paper --config ""` runtime error.
+ExecStart=/bin/bash -c 'set -euo pipefail; VENUE="$${INSTANCE%%%%-*}"; CONF="$$(cat "/etc/swingforge/paper/$$INSTANCE.conf")"; [[ -n "$$CONF" ]] || { echo "empty config for instance $$INSTANCE" >&2; exit 78; }; exec /opt/swingforge/.venv/bin/swingforge paper --venue "$$VENUE" --config "$$CONF"'
+
+# Restart=on-failure/RestartSec=30 will keep retrying if `swingforge paper` exits non-zero
+# -- but exit code 3 means it found an *orphaned open trade* left over from before this
+# instance's last stop (e.g. from stopping it around a manual tournament/full re-backfill
+# per deploy/README.md sections 0/5/7/12) and refused to start rather than silently resume
+# risk it can no longer verify; `journalctl -u swingforge-paper@<instance>` names the
+# orphaned trade. Retrying on a timer will not fix this. Before it will start again,
+# either let the trade close naturally, or run `/opt/swingforge/.venv/bin/swingforge paper
+# --venue <venue> --config <config_id> --abandon-open-trade` once, manually, as the
+# `swingforge` user (closes the orphaned trade at 0R in the `trades` table -- a paper-only
+# concession, never applicable to a live account), then let systemd take over again.
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/swingforge
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

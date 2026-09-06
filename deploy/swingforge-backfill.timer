@@ -1,0 +1,15 @@
+[Unit]
+Description=Timer for swingforge nightly backfill
+Documentation=https://github.com/darkosedam-svg/swingforge/blob/main/deploy/README.md
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+# Spread the actual start over a random window so a fleet of these VPSes (or this one
+# racing a manual run that took the .venue.lock flock right at 00:10) doesn't all fire at
+# exactly the same instant.
+RandomizedDelaySec=300
+Unit=swingforge-backfill.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,48 @@
+[Unit]
+Description=swingforge nightly backfill (hyperliquid, then oanda)
+Documentation=https://github.com/darkosedam-svg/swingforge/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User=root: the backfill command below drops to the unprivileged `swingforge` user via
+# `sudo -u` for each venue, with the relevant env vars carried through explicitly (`sudo`
+# does not preserve the environment by default). Running the unit itself as root means that
+# `sudo -u swingforge` needs no dedicated sudoers rule (root's default `ALL=(ALL) ALL` entry
+# already covers it).
+User=root
+WorkingDirectory=/opt/swingforge
+EnvironmentFile=/etc/swingforge.env
+# Backfilling 4 years of bars for two venues (the very first run) can run long; do not let
+# systemd's default 90s start timeout kill it mid-run. Every subsequent nightly run through
+# this same unit is incremental -- it only fetches the bars since the last run -- and
+# normally holds a venue's DuckDB file for a few minutes, not hours.
+TimeoutStartSec=infinity
+
+# This unit does NOT stop or restart swingforge-paper@ instances around the run (it used
+# to, via ExecStartPre/ExecStopPost -- removed). The incremental nightly backfill only
+# holds a venue's file for a few minutes, and `swingforge paper` already retries a locked
+# store for up to ~5 minutes (PERSIST_RETRIES=30 x 10s) before giving up, so a paper
+# instance rides out this window on its own; it only exits if the lock outlives that retry
+# budget. Meanwhile the dashboard's own open-retry-then-`503 {"detail": "venue busy"}`
+# handling (see deploy/README.md section 0 and swingforge/web/app.py) covers requests
+# against the busy venue the same way it always has -- just retry.
+#
+# A manual long run (a full re-backfill, or `tournament`) is different: it holds the file
+# for hours, not minutes, well past paper's retry budget -- deploy/README.md sections 0/5/7
+# still require stopping the relevant paper instance(s) yourself first for those.
+
+# flock -n: fail fast rather than queue behind another writer already holding
+# /var/lib/swingforge/.venue.lock (a manual `backfill`/`tournament` run per README section 0/9
+# takes this same lock) instead of piling up two processes waiting on the same DuckDB file.
+# Both venue backfills run inside one ExecStart so a single exit code reflects either
+# failing; `|| rc=1` (rather than `&&`, or letting `set -e` abort early) means the oanda
+# backfill still runs even if the hyperliquid one failed, and the unit still fails overall.
+# ExecStart has no "-" prefix on purpose: unlike a "-"-prefixed command, its exit status
+# fails the unit, so a backfill failure shows up in `systemctl status`/`journalctl` instead
+# of being silently swallowed.
+ExecStart=/usr/bin/flock -n /var/lib/swingforge/.venue.lock /bin/bash -c 'rc=0; /usr/bin/sudo -u swingforge --preserve-env=SWINGFORGE_DATA_DIR,OANDA_TOKEN,OANDA_ACCOUNT_ID,OANDA_ENV,HL_ACCOUNT_ADDRESS /opt/swingforge/.venv/bin/swingforge backfill --venue hyperliquid --years 4 || rc=1; /usr/bin/sudo -u swingforge --preserve-env=SWINGFORGE_DATA_DIR,OANDA_TOKEN,OANDA_ACCOUNT_ID,OANDA_ENV,HL_ACCOUNT_ADDRESS /opt/swingforge/.venv/bin/swingforge backfill --venue oanda --years 4 || rc=1; exit $$rc'
+
+StandardOutput=journal
+StandardError=journal
