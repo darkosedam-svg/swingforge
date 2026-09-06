@@ -1,0 +1,14 @@
+.worktrees/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+*.duckdb
+*.duckdb.wal
+data/
+reports/
+.env
+.ruff_cache/
