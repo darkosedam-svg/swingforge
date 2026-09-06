@@ -644,3 +644,114 @@ def test_fills_async_iterator_yields_produced_fills() -> None:
 
     got = asyncio.run(_collect_one())
     assert got == produced[0]
+
+
+def test_fills_awaits_readiness_event_instead_of_busy_waiting() -> None:
+    """Regression pin: a consumer with an empty queue must suspend on an `asyncio.Event`,
+    not spin-poll via `while True: await asyncio.sleep(0)`. We patch `asyncio.Event.wait`
+    to record that it was actually awaited -- a busy-waiting implementation never calls
+    `Event.wait` at all, so `wait_calls` is what actually distinguishes the two
+    implementations (both leave the task merely "still pending" after a short sleep).
+    """
+    broker = PaperBroker(FakeCostModel(), FakeExitResolver())
+    wait_calls = 0
+    original_wait = asyncio.Event.wait
+
+    async def _tracking_wait(self: asyncio.Event) -> bool:
+        nonlocal wait_calls
+        wait_calls += 1
+        return await original_wait(self)
+
+    async def _run() -> None:
+        agen = broker.fills()
+        task = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0.05)
+
+        assert not task.done()  # nothing produced yet: consumer is still waiting
+        assert wait_calls >= 1  # ... but by awaiting the event, not by spinning
+
+        broker.submit(_entry("e1", kind="market"))
+        broker.on_bar(_bar(TS0, open_=100.0), 0)
+
+        fill = await task
+        assert fill.order_id == "e1"
+        await agen.aclose()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(asyncio.Event, "wait", _tracking_wait)
+        asyncio.run(_run())
+
+
+def test_fills_delivers_fills_produced_after_the_consumer_started_in_order() -> None:
+    """Fills produced by `on_bar` calls made *after* a consumer is already awaiting
+    `fills()` on an empty queue must still be delivered, in the order they were produced.
+    """
+    broker = PaperBroker(FakeCostModel(), FakeExitResolver())
+
+    async def _run() -> list[str]:
+        agen = broker.fills()
+        collected: list[str] = []
+
+        async def _consume() -> None:
+            try:
+                async for fill in agen:
+                    collected.append(fill.order_id)
+                    if len(collected) == 2:
+                        return
+            finally:
+                await agen.aclose()
+
+        task = asyncio.ensure_future(_consume())
+        await asyncio.sleep(0)  # let the consumer start awaiting on the empty queue
+
+        broker.submit(_entry("e1", kind="market"))
+        broker.on_bar(_bar(TS0, open_=100.0), 0)
+        broker.submit(_entry("e2", kind="market"))
+        broker.on_bar(_bar(TS0 + timedelta(hours=4), open_=100.0), 1)
+
+        await task
+        return collected
+
+    collected = asyncio.run(_run())
+    assert collected == ["e1", "e2"]
+
+
+def test_close_drains_pending_fills_before_ending_the_stream() -> None:
+    broker = PaperBroker(FakeCostModel(), FakeExitResolver())
+    broker.submit(_entry("e1", kind="market"))
+    broker.on_bar(_bar(TS0, open_=100.0), 0)  # one fill queued before the consumer starts
+
+    broker.close()
+
+    async def _run() -> list[str]:
+        return [fill.order_id async for fill in broker.fills()]
+
+    collected = asyncio.run(_run())
+    assert collected == ["e1"]  # drained before the stream ended
+
+
+def test_close_wakes_a_blocked_consumer_and_ends_the_stream() -> None:
+    """The bug `close()` fixes: before it existed, a consumer blocked on an empty queue
+    had no way to be told the stream is over, so `async for fill in broker.fills(): ...`
+    would hang forever. `asyncio.wait_for` turns that hang into a test failure instead of
+    an indefinite wait.
+    """
+    broker = PaperBroker(FakeCostModel(), FakeExitResolver())
+
+    async def _run() -> list[str]:
+        collected: list[str] = []
+
+        async def _consume() -> None:
+            async for fill in broker.fills():
+                collected.append(fill.order_id)
+
+        task = asyncio.ensure_future(_consume())
+        await asyncio.sleep(0.05)
+        assert not task.done()  # blocked: queue is empty
+
+        broker.close()
+        await asyncio.wait_for(task, timeout=1.0)
+        return collected
+
+    collected = asyncio.run(_run())
+    assert collected == []

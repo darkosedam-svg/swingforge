@@ -37,6 +37,7 @@ _TF_SPAN: dict[str, timedelta] = {
 }
 _EXIT_LEGS = ("stop", "target", "partial", "time")
 _MAX_QUEUED_FILLS = 10_000
+_MAX_LOG_ENTRIES = 100_000
 _QTY_EPSILON = 1e-9
 """Relative epsilon for "is this trade flat": `remaining <= entry_qty * _QTY_EPSILON` is
 treated as closed. Guards `positions()`/carry-accrual against float dust (e.g. a partial
@@ -100,7 +101,20 @@ class PaperBroker:
         # memory for a long-running paper session without that failure mode.
         self._fill_queue: collections.deque[Fill] = collections.deque(maxlen=_MAX_QUEUED_FILLS)
         self._last_carry_bar_index: int | None = None
-        self.log: list[FillLog] = []
+        # Bounded the same way, and for the same reason, as `_fill_queue`: a long-running
+        # paper session must not grow this without limit. `log` is a convenience for
+        # introspection (tests, a REPL session) -- the durable audit trail is the store's
+        # `fills` table, written by the CLI as each fill is produced -- so dropping the
+        # oldest entries here (only once a session has produced over 100,000 fills) never
+        # loses anything that isn't already persisted elsewhere.
+        self.log: collections.deque[FillLog] = collections.deque(maxlen=_MAX_LOG_ENTRIES)
+        # `_fill_ready` is created lazily (see `_ensure_fill_ready`) rather than here in
+        # `__init__`, so a broker constructed outside a running event loop (e.g. at
+        # module import time, or in a sync test fixture) stays constructible -- the
+        # `asyncio.Event` only comes into being the first time `on_bar` or `fills` actually
+        # needs one, which happens once a loop is running.
+        self._fill_ready: asyncio.Event | None = None
+        self._closed = False
 
     # -- Broker protocol ----------------------------------------------------
 
@@ -144,13 +158,49 @@ class PaperBroker:
         fills = [*self._fill_entries(bar), *self._fill_exits(bar)]
         for fill in fills:
             self._fill_queue.append(fill)
+        if fills:
+            self._ensure_fill_ready().set()
         return fills
 
     async def fills(self) -> AsyncIterator[Fill]:
+        """Stream fills as they're produced by `on_bar`.
+
+        Awaits an `asyncio.Event` instead of polling: a consumer with nothing to read
+        suspends here rather than burning a core in a busy `while True: await
+        asyncio.sleep(0)` spin. `on_bar` sets the event every time it appends at least one
+        fill, so a suspended consumer wakes as soon as one is available.
+
+        `close()` ends the stream (this generator returns, so a consumer's `async for fill
+        in broker.fills(): ...` completes normally) once the queue has been fully drained
+        -- a fill queued before `close()` is still delivered.
+
+        The queue behind this stream is a bounded deque (see `_fill_queue`'s docstring):
+        it drops the oldest fill only if a consumer falls more than 10,000 fills behind
+        production, which the store's `fills` table (the durable audit trail, written by
+        the CLI as each fill is produced) never does.
+        """
+        event = self._ensure_fill_ready()
         while True:
             while self._fill_queue:
                 yield self._fill_queue.popleft()
-            await asyncio.sleep(0)
+            if self._closed:
+                return
+            event.clear()
+            await event.wait()
+
+    def close(self) -> None:
+        """End the `fills()` stream once its queue has been drained.
+
+        Safe to call whether or not a consumer is currently awaiting `fills()`, and
+        whether or not the queue is currently empty.
+        """
+        self._closed = True
+        self._ensure_fill_ready().set()
+
+    def _ensure_fill_ready(self) -> asyncio.Event:
+        if self._fill_ready is None:
+            self._fill_ready = asyncio.Event()
+        return self._fill_ready
 
     # -- pending-order bookkeeping -------------------------------------------
 

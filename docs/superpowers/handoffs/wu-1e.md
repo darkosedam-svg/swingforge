@@ -11,3 +11,5 @@ New primary keys (code-review pass): `orders(run_id, id)`, `fills(run_id, order_
 Gotchas: DuckDB raises `ModuleNotFoundError: No module named 'pytz'` on native `TIMESTAMPTZ` — every timestamp is a naive `TIMESTAMP` UTC instant, tz reattached on read. `Decimal` fields round-trip as `VARCHAR`.
 
 Gates green (`pytest` 153 passed incl. 2 `slow`, `ruff`, `mypy`, `lint-imports`); coverage store/replay/paper: 96% (replay 100%, store 98%, paper 93%; misses are unreachable-via-public-API defensive branches).
+
+Follow-up fix (wu/1e-fills): `fills()` no longer busy-waits (`while True: await asyncio.sleep(0)`) — it awaits a lazily-created `asyncio.Event` that `on_bar` sets whenever it appends a fill; `close()` sets `_closed` and the event so `fills()` ends (after draining) instead of looping forever, and `log` is now bounded the same way as `_fill_queue` (`deque(maxlen=100_000)`, the store's `fills` table is the real audit trail). Gates green (`pytest` 441 passed, `ruff`, `mypy`, `lint-imports`).
