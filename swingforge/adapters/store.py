@@ -316,6 +316,7 @@ class Store:
         nullable_float_cols: frozenset[str] = frozenset(),
         nullable_int_cols: frozenset[str] = frozenset(),
         nullable_bool_cols: frozenset[str] = frozenset(),
+        hex_blob_cols: frozenset[str] = frozenset(),
     ) -> None:
         """Upsert ``rows`` into ``table`` with one statement instead of one per row.
 
@@ -337,12 +338,16 @@ class Store:
         A nullable column instead gets two arrays: a native-dtype "value" array with an
         arbitrary placeholder (``0``/``0.0``/``""``/``False``) standing in for `None`, and a
         parallel boolean "is `None`" mask; the SELECT reconstructs true SQL ``NULL`` with
-        ``CASE WHEN mask THEN NULL ELSE value END``. (The one exception is a `bytes`/BLOB
-        column such as `trades.context_snapshot`: numpy has no safe variable-length byte
-        dtype, so that one column is built as a plain Python-object array via
-        `np.array(values, dtype=object)` outside every bucket below -- acceptable since
-        run-artifact volume for `trades` is orders of magnitude below the 10k-row
-        `upsert_bars` benchmark this method exists for.)
+        ``CASE WHEN mask THEN NULL ELSE value END``.
+
+        A `bytes`/BLOB column (e.g. `trades.context_snapshot`) has no safe native numpy
+        dtype either -- variable-length bytes, same problem as a string -- so it goes in
+        `hex_blob_cols` instead: each value is hex-encoded (`bytes.hex()`, ASCII-only) into
+        a native fixed-width *unicode* array (same trick as `str_cols`, ~20ms/row -> object
+        -array-free), and the SELECT wraps the column in `from_hex(...)` to decode it back
+        to BLOB on the way in -- the stored column type is unchanged. Measured at
+        ~20ms/row before (an object-dtype array of `bytes`) against negligible after for
+        `write_trades`; see `test_write_trades_2000_under_3s`.
 
         Measured at >200,000 rows/s for a 10,000-bar `upsert_bars` (register + insert
         combined), against ~20 rows/s before -- see `test_upsert_bars_10k_under_5s`.
@@ -390,9 +395,13 @@ class Store:
                 arrays[col] = np.array([False if v is None else v for v in values], dtype="bool")
                 arrays[mask] = np.array([v is None for v in values], dtype="bool")
                 select_exprs.append(f'CASE WHEN "{mask}" THEN NULL ELSE {quoted} END')
+            elif col in hex_blob_cols:
+                if any(v is None for v in values):
+                    raise ValueError(f"column {col!r}: BLOB values must not be None")
+                arrays[col] = np.array([v.hex() for v in values])  # native fixed-width unicode
+                select_exprs.append(f"from_hex({quoted})")
             else:
-                arrays[col] = np.array(values, dtype=object)  # BLOB/bytes: see docstring
-                select_exprs.append(quoted)
+                raise ValueError(f"column {col!r} not declared into any *_cols bucket")
         update_cols = [c for c in columns if c not in conflict_cols]
         col_list = ", ".join(f'"{c}"' for c in columns)
         select_list = ", ".join(select_exprs)
@@ -668,9 +677,13 @@ class Store:
 
     def write_trades(self, run_id: str, trades: Sequence[Trade]) -> None:
         rows = []
+        instrument_cache: dict[tuple[str, str], Instrument | None] = {}
         for trade in trades:
             venue, symbol = trade.instrument.venue, trade.instrument.symbol
-            if self._instrument_by_venue_symbol(venue, symbol) is None:
+            key = (venue, symbol)
+            if key not in instrument_cache:
+                instrument_cache[key] = self._instrument_by_venue_symbol(venue, symbol)
+            if instrument_cache[key] is None:
                 raise ValueError(
                     f"cannot write trade {trade.id!r}: instrument {venue}/{symbol} has not been "
                     "upserted into the instruments table (call upsert_instruments first)"
@@ -715,8 +728,7 @@ class Store:
             datetime_cols=frozenset({"entry_ts"}),
             nullable_float_cols=frozenset({"target", "realized_r"}),
             nullable_int_cols=frozenset({"closed_bar"}),
-            # context_snapshot (BLOB) is left undeclared -> falls to the object-array bucket;
-            # see `_bulk_upsert`'s docstring for why that one column is the accepted exception.
+            hex_blob_cols=frozenset({"context_snapshot"}),
         )
 
     def trades(self, run_id: str) -> list[Trade]:

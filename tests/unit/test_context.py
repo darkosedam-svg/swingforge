@@ -464,3 +464,108 @@ def test_indicator_reads_stay_linear_over_a_four_year_run() -> None:
         ctx.adx("4h")
     elapsed = time.perf_counter() - start
     assert elapsed < 5.0, f"atr+adx over {len(bars)} bars took {elapsed:.1f}s"
+
+
+# --- Multi-step memo (sparse reads) -----------------------------------------
+
+
+def test_sparse_reads_match_dense_reads_bar_by_bar_including_after_trimming() -> None:
+    # Reading every 7th bar must advance the memo by applying the one-step Wilder update
+    # k times (not recompute from scratch), and must land on exactly the same float as
+    # reading every bar -- including once trimming has started discarding old rows.
+    bars = walk(600)
+    dense = Context(BTC, max_bars=50)
+    sparse = Context(BTC, max_bars=50)
+    dense_atr: list[float] = []
+    dense_adx: list[float] = []
+    for bar in bars:
+        dense.push(bar)
+        dense_atr.append(dense.atr("4h", 5))
+        dense_adx.append(dense.adx("4h", 5))
+
+    for i, bar in enumerate(bars):
+        sparse.push(bar)
+        if i % 7 == 0 or i == len(bars) - 1:
+            atr_value = sparse.atr("4h", 5)
+            adx_value = sparse.adx("4h", 5)
+            if math.isnan(dense_atr[i]):
+                assert math.isnan(atr_value)
+            else:
+                assert atr_value == pytest.approx(dense_atr[i], abs=1e-12, rel=1e-12)
+            if math.isnan(dense_adx[i]):
+                assert math.isnan(adx_value)
+            else:
+                assert adx_value == pytest.approx(dense_adx[i], abs=1e-12, rel=1e-12)
+
+
+def test_sparse_reads_survive_a_gap_wider_than_the_retained_window() -> None:
+    # A read gap (k new pushes since the last read) wider than the retained window (here
+    # max_bars=10, so at most 10 bars are ever available to replay) can no longer apply the
+    # one-step update k times -- there aren't k+1 old rows left to anchor it -- so it must
+    # fall back to a full recompute over whatever is currently retained, exactly as a full
+    # rebuild always has (trimming has already discarded the bars a "true" continuation
+    # would need, independent of this memo). That recompute is over the last `max_bars`
+    # bars only, so the reference must be taken over that same trailing window, not the
+    # full untrimmed history.
+    bars = walk(120)
+    ctx = Context(BTC, max_bars=15)
+    for bar in bars[:20]:
+        ctx.push(bar)
+    ctx.atr("4h", 5)
+    ctx.adx("4h", 5)
+    for bar in bars[20:]:
+        ctx.push(bar)
+    # 100 bars pushed since the last read, far more than max_bars=15 can replay.
+    retained = bars[-15:]
+    assert ctx.atr("4h", 5) == pytest.approx(reference_atr(retained, 5), abs=1e-9, rel=1e-12)
+    assert ctx.adx("4h", 5) == pytest.approx(reference_adx(retained, 5), abs=1e-9, rel=1e-12)
+
+
+def test_interleaved_daily_pushes_do_not_disturb_the_4h_memo() -> None:
+    four_h = walk(60, tf="4h")
+    daily = walk(60, tf="1d")
+    ctx = Context(BTC)
+
+    # Read the 4h memo up to date first, sparsely.
+    for i, bar in enumerate(four_h[:30]):
+        ctx.push(bar)
+        if i % 5 == 0:
+            ctx.atr("4h", 5)
+            ctx.adx("4h", 5)
+
+    # Interleave the remaining daily and 4h pushes (each bumps only its own timeframe's
+    # push counter), reading both memos sparsely and at different cadences.
+    for i in range(30):
+        ctx.push(daily[i])
+        if i % 4 == 0:
+            ctx.atr("1d", 5)
+            ctx.adx("1d", 5)
+        ctx.push(four_h[30 + i])
+        if i % 3 == 0:
+            ctx.atr("4h", 5)
+            ctx.adx("4h", 5)
+
+    for bar in daily[30:]:
+        ctx.push(bar)
+
+    assert ctx.atr("4h", 5) == pytest.approx(reference_atr(four_h, 5), abs=1e-9, rel=1e-12)
+    assert ctx.adx("4h", 5) == pytest.approx(reference_adx(four_h, 5), abs=1e-9, rel=1e-12)
+    assert ctx.atr("1d", 5) == pytest.approx(reference_atr(daily, 5), abs=1e-9, rel=1e-12)
+    assert ctx.adx("1d", 5) == pytest.approx(reference_adx(daily, 5), abs=1e-9, rel=1e-12)
+
+
+def test_sparse_indicator_reads_stay_fast_over_a_four_year_run() -> None:
+    # Reading atr/adx every 25th bar (as the tournament does at entries) must cost roughly
+    # one smoothing step per *pushed* bar, not a full O(n) rebuild per *read* -- otherwise
+    # sparse reads over a long run are O(n^2). Today (rebuild-on-gap) this takes >4s here;
+    # the multi-step memo must bring it under the same bound as the dense-read test.
+    bars = walk(8760)
+    ctx = Context(BTC)
+    start = time.perf_counter()
+    for i, bar in enumerate(bars):
+        ctx.push(bar)
+        if i % 25 == 0:
+            ctx.atr("4h")
+            ctx.adx("4h")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, f"sparse atr+adx over {len(bars)} bars took {elapsed:.1f}s"

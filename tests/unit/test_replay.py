@@ -103,6 +103,9 @@ def test_history_attaches_subbars_for_2000_4h_bars_under_2s() -> None:
         store.upsert_bars([*four_h, *one_h])
 
         source = ReplaySource(store)
+        # Warm-up: DuckDB lazily imports pandas on the first parameterised execute (~1-2 s);
+        # keep that one-off cost out of the timed section.
+        store._conn.execute("SELECT ?", [1]).fetchone()
         start = time.perf_counter()
         got = source.history(BTC, "4h", ts, ts + timedelta(hours=4 * n))
         elapsed = time.perf_counter() - start

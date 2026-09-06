@@ -84,6 +84,26 @@ def _or_null(value: float) -> float | None:
     return None if math.isnan(value) else value
 
 
+def _replay_window(ohlcv: np.ndarray, count: int, pushes: int, seen: int) -> np.ndarray | None:
+    """The `k + 1` most recent rows of `ohlcv`, spanning the memo's anchor bar through the
+    latest push, where `k = pushes - seen` is the number of bars pushed since the memo was
+    last read -- or `None` when there is nothing to replay this way.
+
+    The memo's `value` was computed as of push count `seen`, using the bar that was then
+    the newest row. Applying the one-step update once per new push, in order, over that
+    bar and each bar pushed since reproduces the same recurrence a full rebuild would -- as
+    long as that anchor bar is still retained. It is retained exactly when `count >= k + 1`
+    (the buffer holds the last `count` pushes, i.e. push indices `pushes - count + 1` through
+    `pushes`, so push `seen = pushes - k` is present iff `pushes - k >= pushes - count + 1`,
+    i.e. `count >= k + 1`); otherwise trimming has already discarded it and the caller must
+    fall back to a full recompute over whatever is currently retained.
+    """
+    k = pushes - seen
+    if k < 1 or count < k + 1:
+        return None
+    return ohlcv[-(k + 1) :]
+
+
 class Context:
     """Mutable market state for one instrument.
 
@@ -245,12 +265,17 @@ class Context:
 
         NaN until there are at least `n + 1` bars, since the first true range needs a
         previous close. The smoothed value is memoised per `(tf, n)`: a repeat read on the
-        same bar is free, and the next bar costs one smoothing step.
+        same bar is free, and a read after `k >= 1` new bars costs `k` smoothing steps
+        (applied in push order) rather than a rebuild -- unless trimming has discarded the
+        bar the memo was last anchored to, in which case there is no way to replay the gap
+        and a full recompute over the currently retained window is the only option (see
+        `_replay_window`).
         """
         if n < 1:
             raise ValueError("n must be >= 1")
         ohlcv = self.bars(tf)
-        if ohlcv.shape[0] < n + 1:
+        count = ohlcv.shape[0]
+        if count < n + 1:
             return float("nan")
 
         key = (tf, n)
@@ -260,12 +285,14 @@ class Context:
             seen, value = state
             if seen == pushes:
                 return value
-            if seen == pushes - 1:
-                high = float(ohlcv[-1, 1])
-                low = float(ohlcv[-1, 2])
-                prev_close = float(ohlcv[-2, 3])
-                true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                value = _rma_step(value, true_range, n)
+            window = _replay_window(ohlcv, count, pushes, seen)
+            if window is not None:
+                for i in range(1, window.shape[0]):
+                    high = float(window[i, 1])
+                    low = float(window[i, 2])
+                    prev_close = float(window[i - 1, 3])
+                    true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                    value = _rma_step(value, true_range, n)
                 self._atr_state[key] = (pushes, value)
                 return value
 
@@ -279,12 +306,15 @@ class Context:
         NaN until there are at least `2n + 1` bars: n to seed the directional indicators and
         n more DX values to seed their average. A flat series has no directional movement,
         so both DI legs are zero and the ADX is 0.0, not NaN. The smoothed TR, +DM and -DM
-        and the ADX itself are memoised per `(tf, n)`, as for `atr`.
+        and the ADX itself are memoised per `(tf, n)`, as for `atr`: a read after `k >= 1`
+        new bars applies the one-step update `k` times rather than rebuilding, falling back
+        to a full recompute only when trimming has broken continuity (see `_replay_window`).
         """
         if n < 1:
             raise ValueError("n must be >= 1")
         ohlcv = self.bars(tf)
-        if ohlcv.shape[0] < 2 * n + 1:
+        count = ohlcv.shape[0]
+        if count < 2 * n + 1:
             return float("nan")
 
         key = (tf, n)
@@ -294,22 +324,24 @@ class Context:
             seen, tr_s, plus_s, minus_s, value = state
             if seen == pushes:
                 return value
-            if seen == pushes - 1:
-                high = float(ohlcv[-1, 1])
-                low = float(ohlcv[-1, 2])
-                prev_high = float(ohlcv[-2, 1])
-                prev_low = float(ohlcv[-2, 2])
-                prev_close = float(ohlcv[-2, 3])
-                up = high - prev_high
-                down = prev_low - low
-                true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                tr_s = _rma_step(tr_s, true_range, n)
-                plus_s = _rma_step(plus_s, up if (up > down and up > 0) else 0.0, n)
-                minus_s = _rma_step(minus_s, down if (down > up and down > 0) else 0.0, n)
-                plus_di = _ratio(plus_s, tr_s, 100.0)
-                minus_di = _ratio(minus_s, tr_s, 100.0)
-                dx = _ratio(abs(plus_di - minus_di), plus_di + minus_di, 100.0)
-                value = _rma_step(value, dx, n)
+            window = _replay_window(ohlcv, count, pushes, seen)
+            if window is not None:
+                for i in range(1, window.shape[0]):
+                    high = float(window[i, 1])
+                    low = float(window[i, 2])
+                    prev_high = float(window[i - 1, 1])
+                    prev_low = float(window[i - 1, 2])
+                    prev_close = float(window[i - 1, 3])
+                    up = high - prev_high
+                    down = prev_low - low
+                    true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                    tr_s = _rma_step(tr_s, true_range, n)
+                    plus_s = _rma_step(plus_s, up if (up > down and up > 0) else 0.0, n)
+                    minus_s = _rma_step(minus_s, down if (down > up and down > 0) else 0.0, n)
+                    plus_di = _ratio(plus_s, tr_s, 100.0)
+                    minus_di = _ratio(minus_s, tr_s, 100.0)
+                    dx = _ratio(abs(plus_di - minus_di), plus_di + minus_di, 100.0)
+                    value = _rma_step(value, dx, n)
                 self._adx_state[key] = (pushes, tr_s, plus_s, minus_s, value)
                 return value
 

@@ -19,3 +19,5 @@ Deviations (⚠ = directed by the orchestrator):
 - Extra files beyond the plan: `.python-version`, `.gitattributes` (LF), committed `uv.lock`, and `tests/unit/test_protocols.py` (stubs proving every protocol is implementable, plus the documented call sequence). Ruff excludes `docs/` (vendored reference code).
 
 Contract v2 (orchestrator, after review): `ExitRule.initial_stop(signal, ctx) -> float` added (engine sizes against it; ATRFixedR returns its ATR stop, all other rules `signal.stop`); the engine assigns `trade_id` on the entry order too so the broker can attribute the entry fill to the trade (breakeven stop after a partial). `CONTRACT_VERSION = 2`, tag `contract-v2`.
+
+Perf follow-up (wu/perf1): `Context.atr`/`adx`'s memo now advances by any `k >= 1` bars pushed since the last read, applying the one-step Wilder update `k` times over `_replay_window` (the last `k+1` retained rows) instead of rebuilding from scratch whenever `k > 1` — falls back to a full recompute only when trimming has discarded the anchor bar (`count < k + 1`). Public API and semantics unchanged; sparse reads (every 25th bar) over 8,760 4H bars: 4.04s → 0.11s.

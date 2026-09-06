@@ -332,6 +332,93 @@ def test_trades_resolves_instrument_once_per_distinct_venue_symbol(
     assert len(calls) == 2  # one for (hyperliquid, BTC), one for (hyperliquid, ETH)
 
 
+def test_write_trades_resolves_instrument_once_per_distinct_venue_symbol(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three trades, two distinct instruments (BTC used twice) -> exactly 2 lookups.
+
+    `write_trades` validates every trade's instrument is already upserted (one lookup per
+    trade today, ~8ms each); it must cache per distinct (venue, symbol) within the call, as
+    `trades()` already does.
+    """
+    store.upsert_instruments([BTC, ETH])
+    t1 = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(update={"id": "t-1"})
+    t2 = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(update={"id": "t-2"})
+    t3 = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(update={"id": "t-3", "instrument": ETH})
+
+    calls = []
+    original = store._instrument_by_venue_symbol
+
+    def _counting(venue: str, symbol: str) -> Instrument | None:
+        calls.append((venue, symbol))
+        return original(venue, symbol)
+
+    monkeypatch.setattr(store, "_instrument_by_venue_symbol", _counting)
+    store.write_trades("run-1", [t1, t2, t3])
+
+    assert len(calls) == 2  # one for (hyperliquid, BTC), one for (hyperliquid, ETH)
+    assert len(store.trades("run-1")) == 3
+
+
+def test_write_trades_still_rejects_a_missing_instrument_with_cache(store: Store) -> None:
+    # The per-call cache must not paper over a genuinely-missing instrument: nothing has
+    # been upserted, so the very first (and only) lookup must still raise.
+    trade = _trade(datetime(2026, 1, 1, tzinfo=UTC))
+    with pytest.raises(ValueError, match="instrument"):
+        store.write_trades("run-1", [trade])
+
+
+def test_context_snapshot_round_trips_non_empty_and_empty(store: Store) -> None:
+    store.upsert_instruments([BTC])
+    with_snapshot = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"id": "t-1", "context_snapshot": b'{"bar_index": 5}'}
+    )
+    without_snapshot = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"id": "t-2", "context_snapshot": b""}
+    )
+    store.write_trades("run-1", [with_snapshot, without_snapshot])
+    got = {t.id: t for t in store.trades("run-1")}
+    assert got["t-1"].context_snapshot == b'{"bar_index": 5}'
+    assert got["t-2"].context_snapshot == b""
+
+
+def test_context_snapshot_round_trips_nul_and_high_bytes(store: Store) -> None:
+    store.upsert_instruments([BTC])
+    tricky = bytes(range(256))  # every byte value, including NUL (0x00) and high bytes (>=0x80)
+    trade = _trade(datetime(2026, 1, 1, tzinfo=UTC)).model_copy(update={"context_snapshot": tricky})
+    store.write_trades("run-1", [trade])
+    got = store.trades("run-1")
+    assert len(got) == 1
+    assert got[0].context_snapshot == tricky
+
+
+# -- write_trades performance (C2) --------------------------------------------
+
+
+@pytest.mark.slow
+def test_write_trades_2000_under_3s(store: Store) -> None:
+    import time
+
+    store.upsert_instruments([BTC])
+    ts0 = datetime(2020, 1, 1, tzinfo=UTC)
+    trades = [_trade(ts0 + timedelta(hours=4 * i)).model_copy(update={"id": f"t-{i}"}) for i in range(2_000)]
+
+    # DuckDB lazily imports pandas (now that it's a project dependency; see the module-level
+    # note in `store.py`) on a process's *first* parameterized `execute(sql, [...])` call --
+    # a one-time cost (~1-2.5s here) unrelated to `write_trades` itself. A long-running
+    # process pays it once, on whatever query happens to run first; pay it here, before the
+    # timer starts, rather than let test order nondeterministically fold it into the budget.
+    store._instrument_by_venue_symbol(BTC.venue, BTC.symbol)
+
+    start = time.perf_counter()
+    store.write_trades("run-1", trades)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 3.0, f"write_trades(2,000 trades) took {elapsed:.2f}s, expected < 3s"
+
+    count = store._conn.execute("SELECT COUNT(*) FROM trades WHERE run_id = ?", ["run-1"]).fetchone()[0]
+    assert count == 2_000
+
+
 # -- equity -----------------------------------------------------------------
 
 
