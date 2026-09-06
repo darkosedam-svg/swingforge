@@ -32,6 +32,12 @@ instruments too. `submit` returns the id of the newly accepted order; on replace
 replaced order's id is no longer pending, and `cancel` on it is a no-op. Returning `[]` from
 `on_bar` leaves the existing legs untouched — it does not cancel them.
 
+The engine writes the price of every submitted `stop` / `target` leg back into the
+`Trade.stop` / `Trade.target` it hands to the next `on_bar`, so a rule may read `trade.stop`
+as "the stop I last submitted"; exit rules round every price with `round_to_tick`, so those
+fields are always tick-aligned. `attach` and `on_bar` can both be called on the entry-fill
+bar (same `ctx.bar_index`), so order ids must not collide across the two.
+
 Both protocols are read-only with respect to `Context`: the engine owns every mutation.
 """
 
