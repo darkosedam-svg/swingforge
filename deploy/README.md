@@ -22,8 +22,9 @@ repo. Commands are Ubuntu 24.04 / systemd; adjust package names if you use somet
 - **Concurrency rule (paper vs. backfill/tournament).** `swingforge paper` only holds a
   venue's DuckDB file briefly, at each 4H bar close - and if it finds the file locked, it
   retries for up to ~5 minutes (`PERSIST_RETRIES=30 x 10s`) before giving up. The nightly
-  `swingforge-backfill.timer` run is incremental (it only fetches bars since the last run)
-  and normally holds a venue's file for a few minutes - comfortably inside paper's retry
+  `swingforge-backfill.timer` run re-fetches only the venue's retained candle window (see
+  section 4; idempotent upserts) plus the funding settled since the last run, and normally
+  holds a venue's file for a few minutes - comfortably inside paper's retry
   budget, so **the nightly backfill no longer stops or restarts any `swingforge-paper@`
   instance** (see `swingforge-backfill.service`'s own comment). A dashboard request against
   that venue during this window just sees `503 {"detail": "venue busy"}` and succeeds on
@@ -158,8 +159,9 @@ months of 4H bars).
 This is exactly what `swingforge-backfill.timer` fires nightly at `00:10 UTC` (plus up to
 `RandomizedDelaySec=300`; `Persistent=true`, so a missed night due to downtime still runs
 once the box is back). Once the initial 4-year backfill above has completed, every
-subsequent nightly run through this same unit is incremental and normally holds a venue's
-file for only a few minutes - well inside `swingforge paper`'s own retry budget, so the
+subsequent nightly run through this same unit re-fetches only the venue's retained candle
+window plus new funding (idempotent upserts) and normally holds a venue's file for only a
+few minutes - well inside `swingforge paper`'s own retry budget, so the
 unit does **not** stop or restart any `swingforge-paper@*` instance around it (see the
 concurrency rule in section 0 and `swingforge-backfill.service`'s own comment). Only a
 manual **full** re-backfill (this same `--years 4` command run by hand, e.g. to rebuild a
@@ -190,6 +192,9 @@ sudo -u swingforge flock /var/lib/swingforge/.venue.lock \
 sudo systemctl start 'swingforge-paper@*'   # or just the ones you actually enabled
 ```
 
+For `--venue oanda`, plain `sudo -u swingforge` drops the environment, so the run would
+silently price swap at zero: as root, `set -a; . /etc/swingforge.env; set +a` first and
+run it with `sudo --preserve-env=OANDA_TOKEN,OANDA_ACCOUNT_ID,OANDA_ENV -u swingforge ...`.
 Add `--seed N` to pin the RNG. Each run prints `run id: tournament:{venue}:{timestamp}` at
 the end, together with the list of config ids that passed the gate - copy both down (the
 run id feeds step 6's `report --run-id`; a passing config id feeds step 7). `--resume`
@@ -209,21 +214,25 @@ Print the gate summary for the run id that step 5 printed:
 /opt/swingforge/.venv/bin/swingforge report --venue hyperliquid --run-id tournament:hyperliquid:<timestamp from step 5>
 ```
 
-It shows, for that run id:
-- the gate table - which configs passed all 6 rules on pooled OOS trades,
+It prints the pooled gate summary for that run id - one row per config with `n_oos`,
+`exp_oos` and whether it passed all 6 rules - passing configs first. (`--run-id latest`
+only recognises the auto-generated `tournament:<venue>:...` ids; a custom `--run-id` must be
+passed explicitly.) Everything else lives in the markdown report `tournament` wrote under
+`/var/lib/swingforge/reports/` (it prints the exact path):
+- the full gate table with every rule's verdict,
 - IS vs OOS for the top configs,
 - the regime and excursion breakdowns,
-- the cost-stress (2x spread/slippage, 1.5x funding) columns.
-
-(A full markdown copy of the same report also lands under `/var/lib/swingforge/reports/` -
-`tournament` prints its exact path too, if you want a file to keep or share instead.)
+- the cost-stress (2x spread/slippage, 1.5x funding) columns,
+- the excluded instruments and the fill-resolution mode.
 
 Only a config that **passes the gate** goes on to paper (step 8). The `results` table in
 the venue's DuckDB file is the source of truth both `report` and the markdown file were
 generated from, if you want to query it directly - see step 8 for the read-only python
 heredoc pattern used for every direct query in this runbook (there is no `duckdb` CLI
-installed in this deploy, and every query here opens the file read-only so it never fights
-a concurrent writer for the lock).
+installed in this deploy). Every query opens the file read-only, which cannot corrupt a
+writer - but DuckDB's file lock is exclusive across processes even for a read-only open, so
+a query issued while backfill/tournament/paper holds the file fails with
+`duckdb.IOException`; wait for that process to release the file and retry.
 
 ## 7. Enable a gate-passed config for paper
 
@@ -261,20 +270,26 @@ curl -sS -X PUT http://<vps-ip>:8787/api/settings \
   -H "Authorization: Bearer $SWINGFORGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-        "enabled_instruments": {"hyperliquid": ["BTC"]},
-        "paper_configs": ["ict|fixed_r_2|london_ny|hyperliquid:BTC"],
-        "risk_pct": 0.01,
-        "session": "london_ny",
-        "time_stop_bars": 10,
-        "kill_switch": false
+        "venue": "hyperliquid",
+        "settings": {
+          "enabled_instruments": {"hyperliquid": ["BTC"]},
+          "paper_configs": ["ict|fixed_r_2|london_ny|hyperliquid:BTC"],
+          "risk_pct": 0.01,
+          "session": "london_ny",
+          "time_stop_bars": 10,
+          "kill_switch": false
+        }
       }'
 ```
 
-(A `PUT` while backfill/tournament holds that venue's file returns
+(Settings are per venue file - one `PUT` per venue, with that venue in `"venue"` and the
+whole settings object under `"settings"`; a body without that wrapper is rejected with
+`422`. A `PUT` while backfill/tournament holds that venue's file returns
 `503 {"detail": "venue busy"}` - see section 0 - just retry.)
 
-Every `PUT` is appended to the `settings` table's `settings_log`, so the dashboard's
-history shows exactly who changed what and when. The engine only re-reads settings at bar
+Every `PUT` replaces the single row in the `settings` table and appends one row (version,
+payload, timestamp, actor) to the `settings_log` table, so the dashboard's history shows
+exactly who changed what and when. The engine only re-reads settings at bar
 close, so a change lands on the *next* 4H bar, not mid-bar.
 
 ## 8. The 60-day / 30-trade check
@@ -284,8 +299,9 @@ Per the design (spec section 6): a config stays in paper until it has run for
 progress from the dashboard (open positions, last fills) or query the venue's DuckDB file
 directly. Every query in this runbook runs read-only, straight through the venv's own
 `python` in a heredoc, rather than a `duckdb` CLI (there isn't one installed in this
-deploy) - so it's copy-pasteable, and it never opens a file read-write while backfill,
-tournament or another paper instance might hold it:
+deploy) - so it's copy-pasteable and never opens a file read-write. It still needs the
+file's lock (section 6), so run it between bar closes or retry if it reports the file as
+locked:
 
 ```bash
 /opt/swingforge/.venv/bin/python - <<'PY'
@@ -295,14 +311,17 @@ import duckdb
 
 # `swingforge paper` prints `run id: paper:{venue}:{config_id}` at startup (check
 # `journalctl -u swingforge-paper@<instance>` if you didn't watch it start), and the
-# dashboard's /trades/{id} view shows it too. Use that printed id verbatim below. Do NOT
+# dashboard's /api/trades/{run_id}/{trade_id} route carries it too. Use that printed id verbatim below. Do NOT
 # filter by the systemd instance name ("hyperliquid-btc-ict") - that name is local to this
 # VPS's units and never reaches the CLI or gets written to `trades`.
 RUN_ID = "paper:hyperliquid:ict|fixed_r_2|london_ny|hyperliquid:BTC"
 
 con = duckdb.connect("/var/lib/swingforge/hyperliquid.duckdb", read_only=True)
 n_trades, first_trade = con.execute(
-    "SELECT count(*), min(entry_ts) FROM trades WHERE run_id = ?", [RUN_ID]
+    # closed_bar IS NULL is the provisional row paper writes for its open position every
+    # bar - not a completed trade, so it must not count toward the 30.
+    "SELECT count(*), min(entry_ts) FROM trades WHERE run_id = ? AND closed_bar IS NOT NULL",
+    [RUN_ID],
 ).fetchone()
 print(f"n_trades={n_trades} (need >= 30), first_trade={first_trade}")
 if first_trade is not None:
@@ -329,21 +348,25 @@ both land in the *same* file, under different `run_id`s. Say the paper config is
 #    instance name). Get its first trade timestamp from step 8's query (its last is
 #    max(entry_ts) for the same run_id) - call it <paper_start_iso> below.
 
-# 2. Re-run a replay narrowed to exactly that config, instrument and window (not a full
-#    tournament sweep), so its trades land under a fresh, predictable run_id in the same
-#    DuckDB file. --instruments narrows the replay to the paper instrument; --run-id pins
-#    an explicit id instead of the usual auto-generated tournament:{venue}:{timestamp} one,
-#    so you don't have to go find it afterwards. Stop paper for this venue and take the
-#    .venue.lock first (section 0/5):
+# 2. Re-run a replay narrowed to exactly that config and instrument (not a full tournament
+#    sweep), so its trades land under a fresh, predictable run_id in the same DuckDB file.
+#    --instruments narrows the replay to the paper instrument; --run-id pins an explicit id
+#    instead of the usual auto-generated tournament:{venue}:{timestamp} one, so you don't
+#    have to go find it afterwards. Do NOT narrow with --start/--end to the paper window:
+#    the tournament excludes any instrument with fewer than 18 months in the requested
+#    window (insufficient_history), so a 60-day window replays nothing. Replay the store's
+#    whole range and restrict the comparison in step 3's SQL instead. Stop paper for this
+#    venue and take the .venue.lock first (section 0/5):
 sudo systemctl stop 'swingforge-paper@hyperliquid-btc-ict'
 sudo -u swingforge flock /var/lib/swingforge/.venue.lock \
   /opt/swingforge/.venv/bin/swingforge tournament \
   --venue hyperliquid --out /var/lib/swingforge/reports/reconcile --data-dir /var/lib/swingforge \
   --entries ict --exits fixed_r_2 --sessions london_ny --instruments BTC \
-  --run-id reconcile-<date> \
-  --start <paper_start_iso> --end "$(date -u +%FT%TZ)"
+  --run-id reconcile-<date>
 sudo systemctl start 'swingforge-paper@hyperliquid-btc-ict'
-# Use the exact --run-id you passed above ("reconcile-<date>") as <reconcile_run_id> below.
+# Per-config trades are stored under "<run_id>:<config_id>" (only the results rows carry
+# the bare run id), so the id to compare against below is
+# "reconcile-<date>:ict|fixed_r_2|london_ny|hyperliquid:BTC".
 
 # 3. Compare row-by-row: same entry_ts, direction, entry_price and realized_r for every
 #    trade the paper run produced. Any mismatch means the live paper fills diverged from
@@ -355,7 +378,9 @@ sudo systemctl start 'swingforge-paper@hyperliquid-btc-ict'
 import duckdb
 
 PAPER_RUN_ID = "paper:hyperliquid:ict|fixed_r_2|london_ny|hyperliquid:BTC"
-RECONCILE_RUN_ID = "reconcile-<date>"  # the exact --run-id passed in step 2 above
+# The --run-id passed in step 2, a colon, and the config id (see the note there).
+RECONCILE_RUN_ID = "reconcile-<date>:ict|fixed_r_2|london_ny|hyperliquid:BTC"
+PAPER_START = "<paper_start_iso>"  # step 8's first_trade; the replay covers the whole store
 
 con = duckdb.connect("/var/lib/swingforge/hyperliquid.duckdb", read_only=True)
 rows = con.execute(
@@ -365,15 +390,15 @@ rows = con.execute(
         coalesce(p.direction, b.direction)   AS direction,
         p.entry_price AS paper_entry, b.entry_price AS bt_entry,
         p.realized_r  AS paper_r,     b.realized_r  AS bt_r
-    FROM (SELECT * FROM trades WHERE run_id = ?) p
-    FULL OUTER JOIN (SELECT * FROM trades WHERE run_id = ?) b
+    FROM (SELECT * FROM trades WHERE run_id = ? AND entry_ts >= ?) p
+    FULL OUTER JOIN (SELECT * FROM trades WHERE run_id = ? AND entry_ts >= ?) b
       ON p.entry_ts = b.entry_ts AND p.direction = b.direction
     WHERE p.entry_price IS DISTINCT FROM b.entry_price
        OR p.realized_r  IS DISTINCT FROM b.realized_r
        OR p.entry_price IS NULL OR b.entry_price IS NULL
     ORDER BY entry_ts
     """,
-    [PAPER_RUN_ID, RECONCILE_RUN_ID],
+    [PAPER_RUN_ID, PAPER_START, RECONCILE_RUN_ID, PAPER_START],
 ).fetchall()
 for row in rows:
     print(row)
@@ -407,7 +432,8 @@ Only commit the cassette files if that grep is empty.
 ## 11. Kill switch
 
 The dashboard's settings form has a `kill_switch` toggle (`PUT /api/settings` with
-`"kill_switch": true`, or the same body as step 7 with that one field flipped). The
+`"kill_switch": true` inside `"settings"`, i.e. the same body as step 7 with that one
+field flipped). The
 engine checks settings at every bar close, so flipping it stops new entries within one
 bar close, without restarting any systemd unit. Flip it back to resume.
 
