@@ -274,3 +274,17 @@ def test_load_funding_stops_when_a_full_page_does_not_advance() -> None:
 
     assert len(result) == 500
     assert info.calls == 2
+
+
+def test_load_funding_floors_jittered_settlement_times_to_the_hour() -> None:
+    jittered = [_T0 + 48, _T0 + _HOUR_MS + 201, _T0 + 2 * _HOUR_MS + 180]
+    info = PagedFakeInfo(jittered)
+
+    result = load_funding(
+        info, "BTC", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), sleep=lambda _s: None
+    )
+
+    assert [ts for ts, _ in result] == [datetime(2024, 1, 1, h, tzinfo=UTC) for h in range(3)]
+    # The hour's own settlement is what an exact hourly boundary lookup must find.
+    costs = HyperliquidCosts(funding=result)
+    assert costs._rate_at(datetime(2024, 1, 1, 1, tzinfo=UTC)) == result[1][1]

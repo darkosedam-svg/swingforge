@@ -21,7 +21,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -31,12 +30,7 @@ import typer
 import uvicorn
 from dotenv import load_dotenv
 
-from swingforge.adapters.hyperliquid.bars import (
-    DEFAULT_PERPS,
-    HyperliquidBars,
-    hl_instrument,
-    hl_instruments,
-)
+from swingforge.adapters.hyperliquid.bars import HyperliquidBars, hl_instruments, hl_instruments_for
 from swingforge.adapters.hyperliquid.costs import HyperliquidCosts, load_funding
 from swingforge.adapters.oanda.bars import ApiLike, OandaBars, oanda_instrument
 from swingforge.adapters.oanda.costs import OandaCosts, load_financing
@@ -80,13 +74,6 @@ class Venue(StrEnum):
 
 _VENUES: tuple[str, ...] = tuple(v.value for v in Venue)
 _OANDA_SIX: tuple[str, ...] = ("EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY", "XAU_USD")
-_HL_FALLBACK_TICK = Decimal("0.01")
-"""Tick for a `--instruments`-overridden Hyperliquid symbol outside `DEFAULT_PERPS`.
-
-Deriving a precise tick needs a live `meta_and_asset_ctxs` call (`hl_instruments`'s own
-fallback); the override path is for a small, explicit symbol list (tests, a one-off backfill)
-and takes this conservative constant instead rather than pulling in that extra round trip.
-"""
 
 _YEAR = timedelta(days=365)
 _ONE_DAY = timedelta(hours=24)
@@ -150,9 +137,11 @@ def _instruments(venue: str, source: HyperliquidBars | OandaBars, override: str 
     """The instruments to backfill/trade: `--instruments` overrides the venue's own list."""
     symbols = _split(override) if override else None
     if venue == "hyperliquid":
-        if symbols is not None:
-            return [hl_instrument(sym, DEFAULT_PERPS.get(sym, _HL_FALLBACK_TICK)) for sym in symbols]
         assert isinstance(source, HyperliquidBars)
+        if symbols is not None:
+            # Same tick rule as the default path (one `meta_and_asset_ctxs` call): a fixed
+            # fallback tick here would overwrite the store's derived tick on every re-run.
+            return hl_instruments_for(source._get_info(), symbols)
         return hl_instruments(source._get_info(), extra=5)
     if venue == "oanda":
         names = symbols if symbols is not None else list(_OANDA_SIX)
@@ -300,7 +289,12 @@ def _backfill(venue: str, years: int, instruments_opt: str | None, data_dir: str
                     bars = source.history(instrument, tf, window_start, window_end)
                     total += store.upsert_bars(bars)
                 counts[tf] = total
-            store.upsert_funding(instrument, _funding(venue, source, instrument, start, now))
+            # Incremental: funding is append-only per hour, so resume from the last stored
+            # settlement (re-fetching that one row is an idempotent upsert) instead of paging
+            # the whole span again on every nightly run.
+            stored_funding = store.funding(instrument, start, now)
+            funding_start = stored_funding[-1][0] if stored_funding else start
+            store.upsert_funding(instrument, _funding(venue, source, instrument, funding_start, now))
             bar_range = store.bar_range(instrument, "4h")
             months = 0.0 if bar_range is None else months_between(bar_range[0], bar_range[1] + _FOUR_HOURS)
             typer.echo(
@@ -422,6 +416,9 @@ def _tournament(
     typer.echo(f"run id: {run_id}")
     typer.echo(f"report written to {report_path}")
     typer.echo(f"pooled rows: {len(pooled)}; passed: {len(passed)}")
+    # Rule 2's deflation inputs, so a blanket "nothing passes" verdict can be audited: a
+    # handful of tiny-n configs with huge per-trade Sharpes inflate V for the whole run.
+    typer.echo(f"n_trials: {result.n_trials}; trial_sr_variance: {result.trial_sr_variance}")
     typer.echo("passing configs:")
     for row in passed:
         typer.echo(f"  {row['config_id']}")

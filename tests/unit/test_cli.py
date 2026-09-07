@@ -438,12 +438,19 @@ def test_instruments_hyperliquid_default_ranks_via_hl_instruments() -> None:
     assert {"BTC", "ETH", "SOL"} <= {inst.symbol for inst in result}
 
 
-def test_instruments_hyperliquid_override_falls_back_to_a_conservative_tick() -> None:
+def test_instruments_hyperliquid_override_derives_the_tick_like_the_default_path() -> None:
     source = HyperliquidBars(info=_FakeHLInfo())
     result = cli._instruments("hyperliquid", source, "BTC,DOGE")
     by_symbol = {inst.symbol: inst for inst in result}
     assert by_symbol["BTC"].tick_size == DEFAULT_PERPS["BTC"]
-    assert by_symbol["DOGE"].tick_size == cli._HL_FALLBACK_TICK
+    # DOGE: szDecimals 1 -> 1e-4; markPx 0.2 -> 1e-5; the coarser wins (never the old 0.01 fallback).
+    assert by_symbol["DOGE"].tick_size == Decimal("0.0001")
+
+
+def test_instruments_hyperliquid_override_rejects_an_unlisted_symbol() -> None:
+    source = HyperliquidBars(info=_FakeHLInfo())
+    with pytest.raises(ValueError, match="BOGUS"):
+        cli._instruments("hyperliquid", source, "BTC,BOGUS")
 
 
 def test_funding_is_always_empty_for_oanda() -> None:
@@ -453,7 +460,7 @@ def test_funding_is_always_empty_for_oanda() -> None:
 def test_funding_hyperliquid_loads_from_info() -> None:
     source = HyperliquidBars(info=_FakeHLInfo())
     rows = cli._funding("hyperliquid", source, BTC, TS0, TS0 + timedelta(days=1))
-    assert rows == [(datetime.fromtimestamp(1_700_000_000, tz=UTC), 0.0001)]
+    assert rows == [(datetime.fromtimestamp(1_699_999_200, tz=UTC), 0.0001)]
 
 
 def test_build_cost_model_hyperliquid_is_per_instrument_dispatcher() -> None:
@@ -612,6 +619,33 @@ def test_backfill_is_idempotent_and_reports_months(monkeypatch: pytest.MonkeyPat
 
     assert count_1h_second == count_1h_first
     assert count_4h_second == count_4h_first
+
+
+def test_backfill_resumes_funding_from_the_last_stored_settlement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    bars_by_tf = _synthetic_bars_by_tf(BTC, start=datetime(2024, 1, 1, tzinfo=UTC), months=1, seed=3)
+    source = _FakeBackfillSource(bars_by_tf)
+    seen_starts: list[datetime] = []
+    # Inside the `--years 1` window (the resume only looks at stored rows within it).
+    last_settlement = (datetime.now(UTC) - timedelta(days=30)).replace(minute=0, second=0, microsecond=0)
+
+    def fake_funding(venue: str, src: object, instrument: Instrument, start: datetime, end: datetime) -> list:
+        seen_starts.append(start)
+        return [(last_settlement, 0.0001)]
+
+    monkeypatch.setattr(cli, "_bar_source", lambda venue, **kw: source)
+    monkeypatch.setattr(cli, "_instruments", lambda venue, src, override: [BTC])
+    monkeypatch.setattr(cli, "_funding", fake_funding)
+    data_dir = tmp_path / "data"
+    args = ["backfill", "--venue", "hyperliquid", "--years", "1", "--data-dir", str(data_dir)]
+
+    assert runner.invoke(app, args).exit_code == 0
+    assert runner.invoke(app, args).exit_code == 0
+
+    # First run: from the requested window start (nothing stored). Second: from the last row.
+    assert seen_starts[0] < last_settlement
+    assert seen_starts[1] == last_settlement
 
 
 def test_backfill_instruments_override_is_forwarded(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

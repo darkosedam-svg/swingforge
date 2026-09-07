@@ -142,6 +142,19 @@ sudo systemctl start swingforge-backfill.service
 sudo journalctl -u swingforge-backfill.service -f    # watch it run
 ```
 
+**Hyperliquid history depth (verified against the live endpoint, 2026-09-07).** The
+venue's `candleSnapshot` endpoint only serves the most recent 5,000 candles per interval, so
+`--years 4` is an upper bound, not what you get: roughly **27 months of 4H bars**, roughly
+**7 months of 1H bars** (fills before that resolve through the pessimistic path, and the
+report's fill-resolution mode reads `mixed`), and the full four years of Daily bars. The
+nightly run keeps extending the front of that window, so the store grows past 27 months
+over time - but there is no way to reach further back on the venue side; a deeper 4H
+history would need another data source, which is out of scope for v1. Funding history is
+paged (500 entries per call) and does cover the whole span. The "extra five" perps are
+picked by current-day notional volume, which favours fresh listings - expect some of them
+to be excluded from the tournament as `insufficient_history:<months>` (the gate needs 18
+months of 4H bars).
+
 This is exactly what `swingforge-backfill.timer` fires nightly at `00:10 UTC` (plus up to
 `RandomizedDelaySec=300`; `Persistent=true`, so a missed night due to downtime still runs
 once the box is back). Once the initial 4-year backfill above has completed, every

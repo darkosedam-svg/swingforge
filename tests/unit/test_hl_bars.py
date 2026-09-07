@@ -12,11 +12,14 @@ import pytest
 
 from swingforge.adapters.hyperliquid.bars import (
     DEFAULT_PERPS,
+    MAX_RATE_LIMIT_RETRIES,
     HyperliquidBars,
     closed_only,
     hl_instrument,
     hl_instruments,
+    hl_instruments_for,
     select_perp_symbols,
+    with_rate_limit_backoff,
 )
 
 SPAN_MS = 4 * 60 * 60 * 1000
@@ -530,3 +533,77 @@ def test_history_stops_paging_when_a_capped_page_cannot_advance_past_window_star
 
     assert len(info.calls) == 1  # stopped after the first page, did not loop forever
     assert bars == []  # the stale candles all fall well before `start` anyway
+
+
+class _RateLimited(Exception):
+    status_code = 429
+
+
+class _RateLimitingFakeInfo(FakeInfo):
+    """`FakeInfo` whose first `candles_snapshot` call answers with an HTTP 429."""
+
+    def __init__(self, candles: list[dict]) -> None:
+        super().__init__(candles)
+        self._pending = 1
+
+    def candles_snapshot(self, name: str, interval: str, startTime: int, endTime: int) -> list[dict]:
+        if self._pending:
+            self._pending -= 1
+            raise _RateLimited()
+        return super().candles_snapshot(name, interval, startTime, endTime)
+
+
+def test_history_backs_off_and_retries_a_rate_limited_page() -> None:
+    candles = [_candle(i) for i in range(30)]
+    sleeps: list[float] = []
+    src = HyperliquidBars(info=_RateLimitingFakeInfo(candles), rate_limit_sleep=sleeps.append)
+    end = START + timedelta(hours=4 * 30)
+
+    bars = src.history(BTC, "4h", START, end)
+
+    assert len(bars) == 30
+    assert sleeps == [1.0]
+
+
+def test_with_rate_limit_backoff_doubles_the_delay_then_gives_up() -> None:
+    sleeps: list[float] = []
+
+    def always_limited() -> None:
+        raise _RateLimited()
+
+    with pytest.raises(_RateLimited):
+        with_rate_limit_backoff(always_limited, sleep=sleeps.append)
+
+    assert sleeps == [2.0**i for i in range(MAX_RATE_LIMIT_RETRIES)]
+
+
+def test_with_rate_limit_backoff_propagates_other_errors_immediately() -> None:
+    sleeps: list[float] = []
+
+    class _Forbidden(Exception):
+        status_code = 403
+
+    def forbidden() -> None:
+        raise _Forbidden()
+
+    with pytest.raises(_Forbidden):
+        with_rate_limit_backoff(forbidden, sleep=sleeps.append)
+
+    assert sleeps == []
+
+
+def test_hl_instruments_for_derives_ticks_like_hl_instruments() -> None:
+    fake = FakeInfo([])
+    by_symbol = {inst.symbol: inst for inst in hl_instruments(fake, extra=4)}
+
+    result = hl_instruments_for(fake, ["BTC", "ARB", "DOGE"])
+
+    assert [inst.symbol for inst in result] == ["BTC", "ARB", "DOGE"]
+    assert result[0].tick_size == DEFAULT_PERPS["BTC"]
+    assert result[1].tick_size == by_symbol["ARB"].tick_size
+    assert result[2].tick_size == by_symbol["DOGE"].tick_size
+
+
+def test_hl_instruments_for_rejects_an_unlisted_symbol_up_front() -> None:
+    with pytest.raises(ValueError, match="BOGUS"):
+        hl_instruments_for(FakeInfo([]), ["BTC", "BOGUS"])

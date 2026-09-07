@@ -15,21 +15,27 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from typing import Any, Protocol, runtime_checkable
 
 from swingforge.core.types import TF, Bar, Instrument
 
 __all__ = [
     "DEFAULT_PERPS",
+    "MAX_RATE_LIMIT_RETRIES",
+    "RATE_LIMIT_STATUS",
     "HyperliquidBars",
     "InfoLike",
     "closed_only",
     "hl_instrument",
     "hl_instruments",
+    "hl_instruments_for",
     "select_perp_symbols",
+    "with_rate_limit_backoff",
 ]
 
 _INTERVAL_MAP: dict[str, str] = {"1h": "1h", "4h": "4h", "1d": "1d"}
@@ -67,6 +73,29 @@ was tuned for 4H.
 
 _VENUE_CANDLE_CAP = 5000
 """Hyperliquid's own per-`candles_snapshot`-call limit, oldest-first."""
+
+RATE_LIMIT_STATUS = 429
+MAX_RATE_LIMIT_RETRIES = 8
+"""A backfill is a burst of a few hundred info requests (candle pages plus ~60 funding pages
+per coin); the venue answers a burst over its per-IP budget with HTTP 429, surfaced by the
+SDK as `ClientError` with `status_code == 429`. `with_rate_limit_backoff` retries such a
+call with exponential backoff (1, 2, 4, ... seconds; ~4 minutes in total over 8 retries)
+before letting the error propagate. Anything that is not a 429 propagates immediately."""
+
+
+def with_rate_limit_backoff[T](call: Callable[[], T], *, sleep: Callable[[float], None] = time.sleep) -> T:
+    """`call()`, retried with exponential backoff while it raises an HTTP 429 (see above)."""
+    delay = 1.0
+    attempt = 0
+    while True:
+        try:
+            return call()
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != RATE_LIMIT_STATUS or attempt >= MAX_RATE_LIMIT_RETRIES:
+                raise
+            attempt += 1
+            sleep(delay)
+            delay *= 2
 
 
 @runtime_checkable
@@ -117,6 +146,7 @@ class HyperliquidBars:
         poll_delay_s: float = 5.0,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        rate_limit_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if page_ms <= 0:
             raise ValueError(f"page_ms must be > 0, got {page_ms}")
@@ -126,6 +156,7 @@ class HyperliquidBars:
         self.poll_delay_s = poll_delay_s
         self._now = now or (lambda: datetime.now(UTC))
         self._sleep = sleep or asyncio.sleep
+        self._rate_limit_sleep = rate_limit_sleep
 
     def _get_info(self) -> InfoLike:
         if self._info is None:
@@ -153,6 +184,8 @@ class HyperliquidBars:
         Candles are de-duplicated on the open-time key `t` so overlapping page windows
         never yield the same bar twice.
 
+        Every page request goes through `with_rate_limit_backoff` (HTTP 429 -> retry).
+
         A candle counts as closed only if its close time `T` is at or before
         `min(end, now)` (N2): a query whose `end` reaches into the future must not include
         a candle that has not actually closed yet just because `end` alone would allow it.
@@ -171,7 +204,10 @@ class HyperliquidBars:
         gap_pending = False
         while window_start < end_ms:
             window_end = min(window_start + page_ms, end_ms)
-            page = info.candles_snapshot(instrument.symbol, interval, window_start, window_end)
+            page = with_rate_limit_backoff(
+                partial(info.candles_snapshot, instrument.symbol, interval, window_start, window_end),
+                sleep=self._rate_limit_sleep,
+            )
             if gap_pending and not page:
                 raise RuntimeError(
                     f"Hyperliquid candle paging stalled for {instrument.symbol} {tf}: a page "
@@ -262,19 +298,23 @@ def hl_instrument(coin: str, tick_size: Decimal) -> Instrument:
     )
 
 
+def _universe(info: InfoLike) -> dict[str, dict[str, Any]]:
+    """One `meta_and_asset_ctxs()` call, merged per coin: that coin's `universe` entry
+    (`szDecimals`, `isDelisted`, ...) and its asset-ctx entry (`dayNtlVlm`, `markPx`, ...)."""
+    meta, ctxs = info.meta_and_asset_ctxs()
+    universe = meta["universe"]
+    return {asset["name"]: {**asset, **ctx} for asset, ctx in zip(universe, ctxs, strict=True)}
+
+
 def _rank_perps(info: InfoLike, extra: int) -> tuple[list[str], dict[str, dict[str, Any]]]:
     """Shared ranking logic for `select_perp_symbols` and `hl_instruments`: a single
     `meta_and_asset_ctxs()` call, so the two never issue it twice for the same selection.
 
-    Returns the selected symbols plus a per-coin dict merging that coin's `universe` entry
-    (`szDecimals`, ...) and asset-ctx entry (`dayNtlVlm`, `markPx`, ...) together, keyed by
-    coin name, so callers needing both (e.g. `hl_instruments`'s tick fallback) don't need a
-    second pass over the raw API shapes.
+    Returns the selected symbols plus `_universe`'s per-coin dict, so callers needing both
+    (e.g. `hl_instruments`'s tick fallback) don't need a second pass over the raw API shapes.
     """
     base: Sequence[str] = ("BTC", "ETH", "SOL")
-    meta, ctxs = info.meta_and_asset_ctxs()
-    universe = meta["universe"]
-    combined = {asset["name"]: {**asset, **ctx} for asset, ctx in zip(universe, ctxs, strict=True)}
+    combined = _universe(info)
     ranked = sorted(
         ((float(data["dayNtlVlm"]), name) for name, data in combined.items() if name not in base),
         key=lambda pair: pair[0],
@@ -282,6 +322,16 @@ def _rank_perps(info: InfoLike, extra: int) -> tuple[list[str], dict[str, dict[s
     )
     symbols = [*base, *(name for _, name in ranked[:extra])]
     return symbols, combined
+
+
+def _derived_tick(data: Mapping[str, Any]) -> Decimal:
+    """The coarser of a coin's `szDecimals`-derived and `markPx`-derived tick (I4; see
+    `hl_instruments`)."""
+    sz_decimals = int(data["szDecimals"])
+    tick_from_sz = Decimal(1).scaleb(-(5 - sz_decimals))
+    mark_px = float(data["markPx"])
+    tick_from_mark = Decimal(1).scaleb(math.floor(math.log10(mark_px)) - 4) if mark_px > 0 else Decimal(0)
+    return max(tick_from_sz, tick_from_mark)
 
 
 def select_perp_symbols(info: InfoLike, extra: int = 5) -> list[str]:
@@ -318,17 +368,21 @@ def hl_instruments(
     BTC/ETH/SOL at their typical price levels.
     """
     symbols, by_name = _rank_perps(info, extra)
-    instruments: list[Instrument] = []
-    for coin in symbols:
-        tick = ticks.get(coin)
-        if tick is None:
-            data = by_name[coin]
-            sz_decimals = int(data["szDecimals"])
-            tick_from_sz = Decimal(1).scaleb(-(5 - sz_decimals))
-            mark_px = float(data["markPx"])
-            tick_from_mark = (
-                Decimal(1).scaleb(math.floor(math.log10(mark_px)) - 4) if mark_px > 0 else Decimal(0)
-            )
-            tick = max(tick_from_sz, tick_from_mark)
-        instruments.append(hl_instrument(coin, tick))
-    return instruments
+    return [hl_instrument(coin, ticks.get(coin) or _derived_tick(by_name[coin])) for coin in symbols]
+
+
+def hl_instruments_for(
+    info: InfoLike, symbols: Sequence[str], ticks: Mapping[str, Decimal] = DEFAULT_PERPS
+) -> list[Instrument]:
+    """`Instrument`s for an explicit symbol list, with the same tick rule as `hl_instruments`.
+
+    This is what an `--instruments` override must use: giving an overridden coin a fixed
+    fallback tick instead would overwrite the store's derived tick on re-run (a 0.01 tick on
+    a $0.19 coin is 5% of price per half-tick of slippage). A symbol the venue does not list
+    is a `ValueError` up front, before any bar is fetched.
+    """
+    by_name = _universe(info)
+    unknown = [coin for coin in symbols if coin not in by_name and coin not in ticks]
+    if unknown:
+        raise ValueError(f"unknown Hyperliquid perp(s) {unknown!r}")
+    return [hl_instrument(coin, ticks.get(coin) or _derived_tick(by_name[coin])) for coin in symbols]
