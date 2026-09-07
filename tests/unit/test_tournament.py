@@ -542,15 +542,43 @@ def test_run_tournament_counts_the_selection_views_as_trials(tournament_run) -> 
 
 
 @pytest.mark.slow
-def test_run_tournament_trial_variance_is_taken_over_the_real_trials(tournament_run) -> None:
+def test_run_tournament_trial_variance_is_taken_over_the_selectable_trials(tournament_run) -> None:
     _, result, _, _ = tournament_run
     sharpes = [
         gate.sharpe(tournament.realized_rs(trades))
         for config_id, trades in result.oos_trades.items()
-        if "|IS_SELECTED|" not in config_id and len(trades) >= 2
+        if "|IS_SELECTED|" not in config_id and len(trades) >= tournament.V_MIN_TRADES
     ]
-    assert len(sharpes) >= 2
-    assert result.trial_sr_variance == pytest.approx(float(np.var(sharpes, ddof=1)))
+    if len(sharpes) >= 2:
+        assert result.trial_sr_variance == pytest.approx(float(np.var(sharpes, ddof=1)))
+    else:
+        assert result.trial_sr_variance is None
+
+
+def test_trial_variance_ignores_trials_below_the_rule_1_floor() -> None:
+    t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    long_a = [
+        _trade(t0 + timedelta(hours=4 * i), r) for i, r in enumerate([2.0, -1.0, 1.5, -1.0, 0.5, 2.0] * 10)
+    ]
+    long_b = [
+        _trade(t0 + timedelta(hours=4 * i), r) for i, r in enumerate([-1.0, 2.0, -1.0, 3.0, -1.0, 0.0] * 10)
+    ]
+    # Four near-identical stop-outs: |Sharpe| in the hundreds, pure estimator noise.
+    tiny = [_trade(t0 + timedelta(hours=4 * i), r) for i, r in enumerate([-1.0, -1.01, -1.0, -1.01])]
+
+    expected = float(
+        np.var(
+            [gate.sharpe(tournament.realized_rs(long_a)), gate.sharpe(tournament.realized_rs(long_b))], ddof=1
+        )
+    )
+    assert tournament.trial_variance([long_a, long_b, tiny]) == pytest.approx(expected)
+    assert tournament.trial_variance([long_a, long_b]) == pytest.approx(expected)
+    # Below two qualifying trials there is no cross-trial variance to speak of.
+    assert tournament.trial_variance([long_a, tiny]) is None
+    assert tournament.trial_variance([tiny, tiny]) is None
+    # The floor is configurable, and rule 1's default is what the tournament uses.
+    assert tournament.V_MIN_TRADES == 60
+    assert tournament.trial_variance([tiny, tiny], min_trades=2) is not None
 
 
 @pytest.mark.slow

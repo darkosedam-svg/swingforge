@@ -75,6 +75,8 @@ Each is recorded in the relevant handoff note under `docs/superpowers/handoffs/`
 - DuckDB's file lock is exclusive across processes even for read-only opens. The paper process therefore opens its store only briefly at each bar close and retries a locked file for up to five minutes; the dashboard retries briefly and returns 503; the nightly backfill runs under a lock and does not restart paper.
 - Paper does not restore an open position across restarts. It refuses to start over an orphaned open trade unless `--abandon-open-trade` closes it at 0R. Equity rows double as the run's bar clock so trade ids stay unique across restarts.
 - The dashboard may import `adapters.store` (for the atomic settings write); it still cannot import strategies, venue adapters, replay or paper code.
+- Rule 2's cross-trial Sharpe variance is taken over trials with at least 60 pooled out-of-sample trades (rule 1's floor). Shorter trials have unbounded per-trade Sharpe estimates, and on the first real Hyperliquid sweep four-trade trials set the variance to 2,721, which no strategy could clear. The trial count still includes every trial.
+- Hyperliquid serves only its newest 5,000 candles per interval, so a backfill holds about 27 months of 4H bars and 7 months of 1H bars however many years are requested; funding history is paged and complete.
 
 ## Deployment
 

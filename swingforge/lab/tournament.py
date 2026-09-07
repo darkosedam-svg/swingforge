@@ -21,7 +21,10 @@ across already-computed runs, not by replaying anything.
 Sharpe ratio *across the trials that entered the search* (WU-1D: the default
 `1/(T-1)` is an estimator variance and under-deflates). That is only knowable once every
 config has run, so `run_tournament` replays every config first (pass 1), then computes V
-and evaluates every gate (pass 2).
+and evaluates every gate (pass 2). V is taken over the trials holding at least
+`V_MIN_TRADES` pooled OOS trades -- rule 1's own floor -- because the Sharpe of a handful
+of trades is unbounded noise that would otherwise set V for the whole run (see
+`V_MIN_TRADES`).
 
 **What pass 1 keeps.** Only what pass 2 reads: per config a `_Replayed` (trades, 4H bar
 count, resolution mode), and per *instrument* one close series, which every config of that
@@ -42,7 +45,7 @@ import calendar
 import logging
 import math
 import zlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
@@ -80,6 +83,7 @@ __all__ = [
     "SessionFactory",
     "Split",
     "TournamentResult",
+    "V_MIN_TRADES",
     "add_months",
     "buy_and_hold_curve",
     "configs",
@@ -93,6 +97,7 @@ __all__ = [
     "run_tournament",
     "split_trades",
     "stressed_r",
+    "trial_variance",
     "walk_forward_splits",
     "warmup_start",
 ]
@@ -674,6 +679,28 @@ def _pooled_is(trades: Sequence[Trade], splits: Sequence[Split]) -> list[Trade]:
     return [] if not splits else split_trades(trades, splits[-1])[0]
 
 
+V_MIN_TRADES = 60
+"""Pooled OOS trades a trial needs before its Sharpe enters `trial_sr_variance`.
+
+This is rule 1's own minimum (`gate.evaluate`'s `min_trades` default). The per-observation
+Sharpe of a two-to-five-trade trial is unbounded -- four identical -1R stops that differ only
+by cost jitter give |SR| ~ 170 -- and one such trial sets V for the whole run: the first real
+Hyperliquid sweep (2026-09-07, 740 trials) measured V = 2721, an `sr_star` no strategy could
+clear, before rule 1 had even been considered. Only a trial that could itself be selected
+under rule 1 says anything about how far the search could have pushed a *selectable* Sharpe,
+so shorter trials are left out of V. `n_trials` still counts every trial, so the deflation
+stays conservative on N; with fewer than two qualifying trials V is `None` and the gate falls
+back to its analytical `1/(T-1)`.
+"""
+
+
+def trial_variance(pooled: Iterable[Sequence[Trade]], *, min_trades: int = V_MIN_TRADES) -> float | None:
+    """`trial_sr_variance` for pass 2: the variance (ddof=1) of the per-observation Sharpe
+    across every trial holding at least `min_trades` pooled OOS trades; `None` below two."""
+    sharpes = [gate.sharpe(realized_rs(trades)) for trades in pooled if len(trades) >= min_trades]
+    return float(np.var(sharpes, ddof=1)) if len(sharpes) >= 2 else None
+
+
 def run_tournament(
     store: Store,
     instruments: Sequence[Instrument],
@@ -778,8 +805,7 @@ def run_tournament(
         for config in matrix.configs
         if config.id in matrix.replayed
     }
-    trial_sharpes = [gate.sharpe(realized_rs(t)) for t in pooled.values() if len(t) >= 2]
-    trial_sr_variance = float(np.var(trial_sharpes, ddof=1)) if len(trial_sharpes) >= 2 else None
+    trial_sr_variance = trial_variance(pooled.values())
 
     selection, views = _is_selected_views(
         matrix.replayed, splits_by_instrument, ordered, exits, sessions, windows
