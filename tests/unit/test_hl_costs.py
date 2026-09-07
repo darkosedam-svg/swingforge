@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -182,3 +182,95 @@ def test_load_funding_shapes_and_sorts_history() -> None:
 
     assert [rate for _, rate in result] == [0.0001, 0.0002]
     assert result[0][0] < result[1][0]
+
+
+class PagedFakeInfo:
+    """A `funding_history` that behaves like the real endpoint: at most `cap` entries per call,
+    oldest first, filtered to `startTime <= time <= endTime`; optionally raising a 429 first."""
+
+    def __init__(self, times: list[int], *, cap: int = 500, rate_limit_first: bool = False) -> None:
+        self.times = sorted(times)
+        self.cap = cap
+        self.calls: list[tuple[int, int | None]] = []
+        self._rate_limit_pending = rate_limit_first
+
+    def funding_history(self, name: str, startTime: int, endTime: int | None = None) -> list[dict]:  # noqa: N803
+        self.calls.append((startTime, endTime))
+        if self._rate_limit_pending:
+            self._rate_limit_pending = False
+            raise _RateLimited()
+        selected = [t for t in self.times if t >= startTime and (endTime is None or t <= endTime)]
+        return [
+            {"coin": name, "fundingRate": f"{t % 7:.0f}e-5", "premium": "0", "time": t}
+            for t in selected[: self.cap]
+        ]
+
+
+class _RateLimited(Exception):
+    status_code = 429
+
+
+_HOUR_MS = 3_600_000
+_T0 = 1704067200000  # 2024-01-01T00:00Z
+
+
+def test_load_funding_pages_past_the_venue_cap() -> None:
+    times = [_T0 + i * _HOUR_MS for i in range(1203)]  # ~50 days of hourly funding, 3 pages
+    info = PagedFakeInfo(times)
+
+    result = load_funding(
+        info, "BTC", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 3, 1, tzinfo=UTC), sleep=lambda _s: None
+    )
+
+    assert len(result) == 1203
+    assert [ts for ts, _ in result] == sorted({ts for ts, _ in result})
+    assert result[0][0] == datetime(2024, 1, 1, tzinfo=UTC)
+    assert result[-1][0] == datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=1202)
+    assert len(info.calls) == 3
+    assert info.calls[1][0] == times[499] + 1  # resumes just past the previous page's last entry
+
+
+def test_load_funding_single_short_page_makes_one_call() -> None:
+    info = PagedFakeInfo([_T0 + i * _HOUR_MS for i in range(10)])
+
+    result = load_funding(
+        info, "BTC", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), sleep=lambda _s: None
+    )
+
+    assert len(result) == 10
+    assert len(info.calls) == 1
+
+
+def test_load_funding_backs_off_and_retries_on_rate_limit() -> None:
+    info = PagedFakeInfo([_T0 + i * _HOUR_MS for i in range(10)], rate_limit_first=True)
+    sleeps: list[float] = []
+
+    result = load_funding(
+        info, "BTC", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), sleep=sleeps.append
+    )
+
+    assert len(result) == 10
+    assert len(info.calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_load_funding_stops_when_a_full_page_does_not_advance() -> None:
+    class StuckInfo:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def funding_history(self, name: str, startTime: int, endTime: int | None = None) -> list[dict]:  # noqa: N803
+            self.calls += 1
+            # A misbehaving venue: the same full page regardless of startTime.
+            return [
+                {"coin": name, "fundingRate": "0.0001", "premium": "0", "time": _T0 + i * _HOUR_MS}
+                for i in range(500)
+            ]
+
+    info = StuckInfo()
+    result = load_funding(
+        info, "BTC", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 6, 1, tzinfo=UTC), sleep=lambda _s: None
+    )
+
+    assert len(result) == 500
+    assert info.calls == 2

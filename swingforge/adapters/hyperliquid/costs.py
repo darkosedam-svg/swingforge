@@ -17,8 +17,10 @@ its own instantaneous mark price.
 from __future__ import annotations
 
 import bisect
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from swingforge.adapters.hyperliquid.bars import InfoLike
 from swingforge.core.types import Bar, CostBreakdown, Order, Position
@@ -107,12 +109,65 @@ class HyperliquidCosts:
         return total
 
 
-def load_funding(info: InfoLike, coin: str, start: datetime, end: datetime) -> list[tuple[datetime, float]]:
-    """Fetch and shape `info.funding_history` into `(timestamp, rate)` pairs, oldest first."""
-    raw = info.funding_history(coin, _to_ms(start), _to_ms(end))
-    entries = [
-        (datetime.fromtimestamp(int(entry["time"]) / 1000, tz=UTC), float(entry["fundingRate"]))
-        for entry in raw
-    ]
-    entries.sort(key=lambda entry: entry[0])
-    return entries
+_FUNDING_PAGE_CAP = 500
+"""Hyperliquid returns at most 500 `fundingHistory` entries per call, oldest first.
+
+Verified against the live endpoint on 2026-09-07: a four-year BTC window came back as exactly
+500 hourly rows, 2023-05-12 to 2023-06-25. `load_funding` therefore pages by `time`, resuming
+one millisecond past each full page's last entry, until a page comes back short or empty.
+"""
+
+_RATE_LIMIT_STATUS = 429
+_MAX_RATE_LIMIT_RETRIES = 6
+"""Paging a multi-year span is ~60 calls per coin; the venue answers a burst that exceeds its
+per-IP budget with HTTP 429 (`ClientError.status_code`). Each page retries with exponential
+backoff (1, 2, 4, ... seconds) up to this many times before the error propagates."""
+
+
+def _funding_page(
+    info: InfoLike, coin: str, start_ms: int, end_ms: int, sleep: Callable[[float], None]
+) -> list[dict[str, Any]]:
+    delay = 1.0
+    attempt = 0
+    while True:
+        try:
+            return info.funding_history(coin, start_ms, end_ms)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != _RATE_LIMIT_STATUS or attempt >= _MAX_RATE_LIMIT_RETRIES:
+                raise
+            attempt += 1
+            sleep(delay)
+            delay *= 2
+
+
+def load_funding(
+    info: InfoLike,
+    coin: str,
+    start: datetime,
+    end: datetime,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    page_cap: int = _FUNDING_PAGE_CAP,
+) -> list[tuple[datetime, float]]:
+    """Every `info.funding_history` entry in `[start, end]` as `(timestamp, rate)`, oldest first.
+
+    Pages past the venue's per-call cap (`_FUNDING_PAGE_CAP`): a page that comes back full is
+    resumed from its last entry's `time + 1 ms`; a short or empty page ends the walk. Entries
+    are de-duplicated on `time`, so an overlapping page never yields a boundary twice. A full
+    page whose last entry does not advance the cursor (a misbehaving venue) ends the walk too,
+    rather than looping forever. `sleep` is injectable so the 429 backoff is testable.
+    """
+    start_ms, end_ms = _to_ms(start), _to_ms(end)
+    raw: dict[int, float] = {}
+    cursor = start_ms
+    while cursor <= end_ms:
+        page = _funding_page(info, coin, cursor, end_ms, sleep)
+        if not page:
+            break
+        for entry in page:
+            raw[int(entry["time"])] = float(entry["fundingRate"])
+        last = max(int(entry["time"]) for entry in page)
+        if len(page) < page_cap or last + 1 <= cursor:
+            break
+        cursor = last + 1
+    return sorted((datetime.fromtimestamp(t / 1000, tz=UTC), rate) for t, rate in raw.items())
