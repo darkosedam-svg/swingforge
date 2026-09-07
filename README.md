@@ -12,7 +12,9 @@ All work units of the implementation plan are merged and verified:
 - Import layering (`core` ← `strategies`/`adapters` ← `lab` ← `web`) is enforced by `import-linter` inside the test suite.
 - The planted-edge integration test shows the real ICT entry clearing all six gate rules while the random baseline never does, and nothing passes on edge-free or pure-random-walk data.
 
-What remains is human-only: record the venue cassettes with real credentials, provision the VPS, backfill, run the tournament, and enable gate-passing configs for the 60-day paper window. See `deploy/README.md`.
+The Hyperliquid half of the runbook has been executed locally (2026-09-07). The contract cassette is recorded, the store holds 8 instruments (27 months of 4H bars for BTC/ETH/SOL/ARB, the venue's retention limit; funding complete), and the first tournament, `tournament:hyperliquid:20260907`, graded 740 trials: **none pass**. Every config fails rule 1. ICT with no session filter produces about 13 in-sample trades per 12 months and 7 out-of-sample per 15 months per config, zones fewer, and the largest out-of-sample count anywhere is 13 against the 60 required. An adversarial investigation of that frequency found the engine drops nothing (replays reproduce the stored trades exactly, and the vendored reference analyzer reproduces the port's setup count month for month), three strategy defects that would roughly double ICT's count without reaching 60 (ICT re-anchors its liquidity range to the current close every bar; zones consume freshness only on bars the engine consults; consecutive Daily impulses append duplicate zones), and that at the observed per-trade Sharpe of 0.2 to 0.65 rule 2 would need 60 to 100 out-of-sample trades, which is 11 to 24 years at these frequencies. No paper config is enabled. The next step is a decision: fix the defects and re-run, pool instruments per entry family or revisit the gate, or source deeper 4H history.
+
+Still human-only: OANDA credentials (cassette, backfill, tournament) and the VPS itself. See `deploy/README.md`.
 
 ## Layout
 
