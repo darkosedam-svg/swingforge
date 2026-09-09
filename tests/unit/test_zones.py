@@ -67,11 +67,18 @@ def _flat_daily(n: int, close: float = 100.0, rng: float = 2.0, start: int = 0) 
     return [_daily(start + i, close, close + rng / 2, close - rng / 2, close) for i in range(n)]
 
 
+H4_START = START + timedelta(days=17)
+"""Where the 4H fixtures begin: the instant the impulse fixtures' last Daily bar (day 16)
+closes. A zone can only be touched by a 4H bar that opened at or after its Daily bar
+closed - a 4H bar dated before the Daily bars that spawned the zone could never touch it.
+A test whose Daily series runs past day 16 must offset its 4H indices accordingly."""
+
+
 def _h4(index: int, close: float, instrument: Instrument = PERP) -> Bar:
     return Bar(
         instrument=instrument,
         tf="4h",
-        ts_open=START + timedelta(hours=4 * index),
+        ts_open=H4_START + timedelta(hours=4 * index),
         open=close,
         high=close,
         low=close,
@@ -158,7 +165,7 @@ def test_touch_without_close_inside_still_consumes_freshness() -> None:
     overlapping_close_outside = Bar(
         instrument=PERP,
         tf="4h",
-        ts_open=START + timedelta(hours=4),
+        ts_open=H4_START + timedelta(hours=4),
         open=105.0,
         high=105.0,
         low=96.0,
@@ -216,7 +223,7 @@ def test_rejected_signals_counter_increments_when_stop_collapses_onto_entry() ->
     for bar in _flat_daily(20, rng=0.0):
         ctx.push(bar)
     strategy = Zones()
-    zone = _Zone(direction=1, low=100.0, high=100.0)
+    zone = _Zone(direction=1, low=100.0, high=100.0, born_ts=START, source_ts=START)
     assert strategy.rejected_signals == 0
     assert strategy._build_signal(zone, ctx) is None
     assert strategy.rejected_signals == 1
@@ -231,7 +238,7 @@ def test_missing_atr_blocks_signal_construction() -> None:
     for bar in _flat_daily(5):
         ctx.push(bar)
     strategy = Zones()
-    zone = _Zone(direction=1, low=97.0, high=101.0)
+    zone = _Zone(direction=1, low=97.0, high=101.0, born_ts=START, source_ts=START)
     assert strategy._build_signal(zone, ctx) is None
 
 
@@ -311,7 +318,17 @@ def test_keeps_only_the_newest_20_zones() -> None:
     strategy = Zones()
     strategy._detect_new_zones(ctx)
 
-    strategy._zones = [_Zone(direction=1, low=float(i), high=float(i) + 1) for i in range(25)]
+    strategy._zones = [
+        # Source timestamps before the fixture's Daily bars, so none collides with the real zone.
+        _Zone(
+            direction=1,
+            low=float(i),
+            high=float(i) + 1,
+            born_ts=START,
+            source_ts=START - timedelta(days=i + 1),
+        )
+        for i in range(25)
+    ]
     ctx.push(_daily(16, open_=98.0, high=111.0, low=97.0, close=110.0))
     strategy._detect_new_zones(ctx)
     assert len(strategy._zones) == _MAX_ZONES
@@ -345,6 +362,152 @@ def test_zones_keep_detecting_after_the_daily_series_saturates() -> None:
     assert zone.direction == 1
     assert zone.low == pytest.approx(97.0)
     assert zone.high == pytest.approx(101.0)
+
+
+# --- freshness is a property of the bars, not of when the engine consulted the strategy -----
+
+
+def test_a_bar_the_strategy_never_saw_still_consumes_freshness() -> None:
+    """The engine consults a strategy only when flat, with no pending entry and inside the
+    session (core/engine.py), but a zone is used up by the first 4H bar that overlaps it
+    whether or not anyone was watching (spec: the session filter gates entries only). A bar
+    pushed without a consult must burn the zone, so the next bar closing inside it cannot
+    signal. Measured on the 2026-09-07 run: 38 (BTC) / 47 (SOL) such unconsumed touches
+    under 'active', which produced more zone trades than 'none'."""
+    ctx = _demand_impulse_context()
+    strategy = Zones()
+    ctx.push(_h4(0, close=200.0))
+    strategy.on_bar(ctx)
+    zone = strategy._zones[0]
+    assert zone.fresh is True
+
+    # Overlaps [97, 101] but closes outside; the strategy is NOT consulted on this bar.
+    ctx.push(
+        Bar(
+            instrument=PERP,
+            tf="4h",
+            ts_open=H4_START + timedelta(hours=4),
+            open=105.0,
+            high=105.0,
+            low=96.0,
+            close=105.0,
+            volume=1.0,
+        )
+    )
+
+    ctx.push(_h4(2, close=99.0))  # closes squarely inside the zone
+    assert strategy.on_bar(ctx) is None
+    assert zone.fresh is False
+
+
+def test_bars_that_closed_before_the_zone_existed_do_not_consume_it() -> None:
+    """Replaying unseen bars must respect birth order: the opposing candle's own 4H bars
+    overlap the zone by construction, and they closed before the impulse completed. Only a
+    bar that opened at or after the zone's Daily bar closed can touch it."""
+    ctx = Context(PERP)
+    for bar in _flat_daily(15):
+        ctx.push(bar)
+    ctx.push(_daily(15, open_=100.0, high=101.0, low=97.0, close=98.0))
+    # Day 16's own 4H bars sit inside the future zone [97, 101] (never consulted).
+    for i in range(6):
+        ctx.push(
+            Bar(
+                instrument=PERP,
+                tf="4h",
+                ts_open=START + timedelta(days=16, hours=4 * i),
+                open=99.0,
+                high=99.5,
+                low=98.5,
+                close=99.0,
+                volume=1.0,
+            )
+        )
+    ctx.push(_daily(16, open_=98.0, high=111.0, low=97.0, close=110.0))  # closes on day 17
+    strategy = Zones()
+
+    ctx.push(_h4(0, close=200.0))  # day 17 00:00: first consult, detection, replay
+    assert strategy.on_bar(ctx) is None
+    zone = strategy._zones[0]
+    assert zone.fresh is True
+
+    ctx.push(_h4(1, close=99.0))
+    signal = strategy.on_bar(ctx)
+    assert signal is not None
+    assert signal.direction == 1
+
+
+def test_consecutive_impulses_from_the_same_opposing_candle_yield_one_zone() -> None:
+    """Day 17 continues day 16's impulse: the close-to-close move from the same start bar
+    still clears the threshold, so `_find_opposing_candle` lands on the same bearish candle.
+    That must not append a second, identical zone (26 of BTC's 54 zones on the 2026-09-07
+    run were exact copies, crowding the 20-zone cap)."""
+    ctx = Context(PERP)
+    for bar in _flat_daily(15):
+        ctx.push(bar)
+    ctx.push(_daily(15, open_=100.0, high=101.0, low=97.0, close=98.0))
+    ctx.push(_daily(16, open_=98.0, high=111.0, low=97.0, close=110.0))
+    ctx.push(_daily(17, open_=110.0, high=113.0, low=109.0, close=112.0))
+    strategy = Zones()
+
+    ctx.push(_h4(6, close=200.0))  # day 18 00:00, after day 17 closed
+    strategy.on_bar(ctx)
+
+    assert [(z.direction, z.low, z.high) for z in strategy._zones] == [(1, 97.0, 101.0)]
+
+
+def test_a_re_detected_zone_does_not_regain_freshness() -> None:
+    """The zone from day 16's impulse is touched (and used) on day 17; day 17's bar then
+    re-selects the same opposing candle. The zone must stay consumed, not come back fresh."""
+    ctx = Context(PERP)
+    for bar in _flat_daily(15):
+        ctx.push(bar)
+    ctx.push(_daily(15, open_=100.0, high=101.0, low=97.0, close=98.0))
+    ctx.push(_daily(16, open_=98.0, high=111.0, low=97.0, close=110.0))
+    strategy = Zones()
+    ctx.push(_h4(0, close=99.0))  # day 17 00:00, inside the zone: signals and consumes it
+    assert strategy.on_bar(ctx) is not None
+
+    ctx.push(_daily(17, open_=110.0, high=113.0, low=109.0, close=112.0))
+    ctx.push(_h4(6, close=200.0))  # day 18 00:00: re-detection
+    assert strategy.on_bar(ctx) is None
+    assert [zone.fresh for zone in strategy._zones] == [False]
+
+    ctx.push(_h4(7, close=99.0))
+    assert strategy.on_bar(ctx) is None
+
+
+def test_the_first_bar_after_the_zone_is_born_can_touch_it() -> None:
+    """The first 4H bar the strategy sees after a Daily close opens exactly at `born_ts`
+    (replay pushes the Daily bar before the 4H bar that opens at the same instant), so the
+    birth rule is `>=`: that bar must be able to touch and use the zone."""
+    ctx = _demand_impulse_context()
+    strategy = Zones()
+    ctx.push(_h4(0, close=99.0))  # ts_open == H4_START == the zone's born_ts
+    signal = strategy.on_bar(ctx)
+    assert signal is not None
+    assert signal.direction == 1
+
+
+def test_touches_are_replayed_from_the_retained_window_after_a_long_consult_gap() -> None:
+    """More than `max_bars` 4H bars pass between two consults: the bar the strategy last saw
+    has been trimmed away, so the whole retained window is replayed - and a touch inside
+    that window still burns the zone."""
+    ctx = Context(PERP, max_bars=40)
+    for bar in _flat_daily(15):
+        ctx.push(bar)
+    ctx.push(_daily(15, open_=100.0, high=101.0, low=97.0, close=98.0))
+    ctx.push(_daily(16, open_=98.0, high=111.0, low=97.0, close=110.0))
+    strategy = Zones()
+    ctx.push(_h4(0, close=200.0))
+    strategy.on_bar(ctx)  # first consult: the zone is detected, fresh
+
+    for i in range(1, 60):  # never consulted; index 45 is the only bar that overlaps the zone
+        ctx.push(_h4(i, close=99.0 if i == 45 else 200.0))
+    assert ctx.offset_of(0) is None  # the last-seen bar is out of the window
+
+    ctx.push(_h4(60, close=99.0))  # closes inside the zone
+    assert strategy.on_bar(ctx) is None
+    assert [zone.fresh for zone in strategy._zones] == [False]
 
 
 # --- performance (C1): the local Wilder ATR series must be incremental ----------------------
