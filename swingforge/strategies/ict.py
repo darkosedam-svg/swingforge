@@ -7,14 +7,43 @@ Asia session range, and the execution timeframe is 4H instead of 5m. The three v
 regression fixes described in that file's module docstring are preserved verbatim in the
 helpers below, since they are exactly what the fixtures in `tests/fixtures/ict_*.json` guard:
 
-* `find_sweep` returns direction ``1`` (long) for a sweep of the range LOW and ``-1`` (short)
-  for a sweep of the HIGH — the reverse of the original, pre-v0.3 mapping. It also requires
-  the sweep candle to have *opened* inside the range, not just closed there, so a pullback
-  candle after a displacement that already left the range is not misread as a fresh sweep in
-  the opposite direction.
+* `find_sweep_against` (and its fixed-range form `find_sweep`) returns direction ``1``
+  (long) for a sweep of the range LOW and ``-1`` (short) for a sweep of the HIGH — the
+  reverse of the original, pre-v0.3 mapping. It also requires the sweep candle to have
+  *opened* inside the range, not just closed there, so a pullback candle after a
+  displacement that already left the range is not misread as a fresh sweep in the opposite
+  direction. Under the strategy's body-anchored range (below) that guard holds by
+  construction; the explicit check stays for the fixed-range shape the reference tests use.
 * `find_bos`'s neckline is the extreme of the candles strictly BEFORE the current one:
   `running_high`/`running_low` is updated *after* the comparison on each iteration, not
   before, so a bar cannot clear its own just-updated extreme by a hair.
+
+The liquidity range is judged *per candidate bar*: `find_sweep_against` asks `range_at(body_low,
+body_high)` for the range around each lookback bar's own body - the nearest Daily swing low
+below the body and the nearest swing high above it, taken from the pivots confirmed as of the
+current bar (a pivot confirmed after the candidate closed but before now is information the
+strategy has at decision time; nothing after the current bar is ever read) - rather than the
+range around the current bar's close. With Daily pivots accumulating ~2.5% apart on real data, the
+displacement that follows a sweep usually closes past the next pivot before the break of
+structure confirms, so a range read off the current close no longer contained the sweep bar
+and the setup was silently lost - measured on the 2026-09-07 Hyperliquid run as ~65% of
+spec-valid sweep->BOS setups. The reference has no such problem because its Asia range is
+fixed for the day. Anchoring on the body (not the close) matters because the pivots are dense
+enough that the swing high nearest above a bar's close often sits below its open. The new range is a
+superset of the old one: it coincides with it whenever no pivot lies between the current close
+and the candidate's body extremes, and only ever admits a bar the old range excluded. The
+v0.3 open-inside guard holds by construction: a pullback candle's body defines its own range,
+so its wick can only ever sweep a pivot on the correct side. The pierce threshold stays global
+- a fraction of the newest close - while the range is per bar; at 0.03% the difference is
+immaterial.
+
+The scan itself keeps the reference's shape: newest-first, and `on_bar` gives up when the
+newest sweep has no break of structure yet. With pivot ranges, sweeps are frequent (roughly a
+fifth of all 4H bars on real data), so a newer sweep can shadow an older setup on the very bar
+it confirms - the second-largest loss the 2026-09-07 investigation measured. Walking every
+candidate and firing for the newest one whose break is the current bar recovers that, but it
+multiplies unplanted setups roughly 2.7x on the synthetic stores and is a separate strategy
+decision, recorded with its measurements in the WU-2A handoff rather than folded into this fix.
 
 One setup fires exactly once: `on_bar` requires the bar completing the break of structure to
 be the current (most recently pushed) 4H bar, and remembers `_last_signalled_sweep` so a
@@ -24,7 +53,9 @@ sweep already signalled is never re-emitted even if a later bar's scan finds it 
 buffer, so a raw-row comparison could coincidentally match a later, unrelated sweep and
 wrongly suppress it. `Context.offset_of` translates it back to a row for the comparison.
 
-The Daily swing-level cache (`_swing_highs_cache`/`_swing_lows_cache`) is incremental: a
+The Daily swing-level cache (`_swing_highs_cache`/`_swing_lows_cache`, each kept sorted so a
+nearest-level lookup is a bisection - `range_at` runs up to twelve of them per 4H bar) is
+incremental: a
 pivot at row `i` only becomes confirmable once row `i + k` has closed (see
 `strategies/levels.py`), so when the Daily series grows from `old_n` to `new_n` bars, only
 the window `[old_n - k, new_n - k)` newly becomes confirmable - the cache is extended by
@@ -36,6 +67,8 @@ advancing again.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right, insort
+from collections.abc import Callable
 from datetime import datetime
 from typing import Literal
 
@@ -48,10 +81,12 @@ from swingforge.strategies.levels import swing_highs, swing_lows
 
 __all__ = [
     "ICT",
+    "RangeAt",
     "find_bos",
     "find_fvg",
     "find_order_block",
     "find_sweep",
+    "find_sweep_against",
 ]
 
 _SWEEP_LOOKBACK = 12
@@ -62,21 +97,29 @@ _FVG_DISPLACEMENT_PAD = 5  # displacement window is [sweep_idx, bos_idx + 5)
 _FVG_MIN_SIZE_PCT = 0.0001  # 0.01%
 
 
-def find_sweep(
+RangeAt = Callable[[float, float], tuple[float, float] | None]
+"""`range_at(body_low, body_high) -> (level_low, level_high) | None`: the liquidity range a
+bar whose body spans `[body_low, body_high]` traded inside - the nearest Daily swing low below
+the body and the nearest swing high above it - or None when no pivot exists on one side."""
+
+
+def find_sweep_against(
     bars4h: np.ndarray,
-    level_low: float,
-    level_high: float,
+    range_at: RangeAt,
     lookback: int,
     min_pierce_pct: float,
 ) -> tuple[int | None, Literal[1, -1] | None]:
-    """Scan the last `lookback` bars, newest-first, for a sweep of `level_low`/`level_high`.
+    """Scan the last `lookback` bars, newest-first, for a sweep, judging each bar against
+    `range_at(body_low, body_high)` - the range around its own body (module docstring).
 
-    A bar whose open AND close both lie inside `[level_low, level_high]` and whose low pierces
-    below `level_low - pierce` is a sweep of the low -> long (``1``). One whose high pierces
-    above `level_high + pierce` is a sweep of the high -> short (``-1``). `pierce` is
+    A bar whose open AND close both lie inside its range and whose low pierces below
+    `level_low - pierce` is a sweep of the low -> long (``1``). One whose high pierces above
+    `level_high + pierce` is a sweep of the high -> short (``-1``). `pierce` is
     `min_pierce_pct` of the most recent bar's close (the "current price"). The open-inside
     requirement is the v0.3 fix: without it a pullback candle that opened outside the range
-    reads as a sweep in the wrong direction.
+    reads as a sweep in the wrong direction. A bar with no range (`range_at` -> None) is
+    skipped. Newest-first, as in the reference: the first sweep found wins, whichever range
+    it belongs to.
     """
     n = bars4h.shape[0]
     if n == 0:
@@ -86,6 +129,12 @@ def find_sweep(
     start = max(0, n - lookback)
     for i in range(n - 1, start - 1, -1):
         open_, high, low, close = (float(x) for x in bars4h[i, :4])
+        bounds = range_at(min(open_, close), max(open_, close))
+        if bounds is None:
+            continue
+        level_low, level_high = bounds
+        # Under `ICT.on_bar`'s body-anchored `range_at` this always holds (the range is built
+        # around the body); it is the v0.3 open-inside guard for a fixed range (`find_sweep`).
         inside = level_low <= close <= level_high and level_low <= open_ <= level_high
         if not inside:
             continue
@@ -94,6 +143,18 @@ def find_sweep(
         if high > level_high + min_pierce:
             return i, -1
     return None, None
+
+
+def find_sweep(
+    bars4h: np.ndarray,
+    level_low: float,
+    level_high: float,
+    lookback: int,
+    min_pierce_pct: float,
+) -> tuple[int | None, Literal[1, -1] | None]:
+    """`find_sweep_against` with one fixed `[level_low, level_high]` for every bar - the
+    reference implementation's shape (a fixed Asia range), kept for its ported tests."""
+    return find_sweep_against(bars4h, lambda _lo, _hi: (level_low, level_high), lookback, min_pierce_pct)
 
 
 def find_bos(
@@ -182,14 +243,16 @@ def _find_ts_row(history: tuple[Bar, ...], ts: datetime) -> int | None:
     return None
 
 
-def _nearest_above(levels: list[float], price: float) -> float | None:
-    above = [level for level in levels if level > price]
-    return min(above) if above else None
+def _nearest_above(sorted_levels: list[float], price: float) -> float | None:
+    """The smallest level strictly above `price`; `sorted_levels` must be ascending."""
+    i = bisect_right(sorted_levels, price)
+    return sorted_levels[i] if i < len(sorted_levels) else None
 
 
-def _nearest_below(levels: list[float], price: float) -> float | None:
-    below = [level for level in levels if level < price]
-    return max(below) if below else None
+def _nearest_below(sorted_levels: list[float], price: float) -> float | None:
+    """The largest level strictly below `price`; `sorted_levels` must be ascending."""
+    i = bisect_left(sorted_levels, price) - 1
+    return sorted_levels[i] if i >= 0 else None
 
 
 def find_order_block(
@@ -247,7 +310,8 @@ class ICT:
         """Extend `_swing_highs_cache`/`_swing_lows_cache` by whatever newly became
         confirmable since the last update - see the module docstring.
 
-        The cache is append-only: a pivot stays available after its Daily bar has been
+        The cache only ever grows (kept sorted for the bisection lookups): a pivot stays
+        available after its Daily bar has been
         trimmed out of the `Context` window, so under a small `max_bars` the liquidity
         range and `structure_target` may anchor on a level a from-scratch scan of the
         retained bars would no longer see. Unreachable at the default `max_bars`.
@@ -271,8 +335,8 @@ class ICT:
                 # if a whole `max_bars` window's worth of Daily bars arrived between two
                 # calls) - bounded (by max_bars, not by total history) fallback: everything
                 # before it is necessarily gone too, so rebuild from what's left.
-                self._swing_highs_cache = [price for _, price in swing_highs(daily, k)]
-                self._swing_lows_cache = [price for _, price in swing_lows(daily, k)]
+                self._swing_highs_cache = sorted(price for _, price in swing_highs(daily, k))
+                self._swing_lows_cache = sorted(price for _, price in swing_lows(daily, k))
                 self._levels_marker_ts = history[end - 1].ts_open if end > 0 else None
                 self._levels_last_daily_ts = last_ts
                 return
@@ -287,11 +351,11 @@ class ICT:
                 window_hi = highs_col[i - k : i + k + 1]
                 pivot_hi = highs_col[i]
                 if pivot_hi == window_hi.max() and np.count_nonzero(window_hi == pivot_hi) == 1:
-                    self._swing_highs_cache.append(float(pivot_hi))
+                    insort(self._swing_highs_cache, float(pivot_hi))
                 window_lo = lows_col[i - k : i + k + 1]
                 pivot_lo = lows_col[i]
                 if pivot_lo == window_lo.min() and np.count_nonzero(window_lo == pivot_lo) == 1:
-                    self._swing_lows_cache.append(float(pivot_lo))
+                    insort(self._swing_lows_cache, float(pivot_lo))
             self._levels_marker_ts = history[end - 1].ts_open
 
         self._levels_last_daily_ts = last_ts
@@ -302,16 +366,16 @@ class ICT:
         if h4.shape[0] < _MIN_H4_BARS or daily.shape[0] < 2 * self.k + 3:
             return None
 
-        close = float(h4[-1, 3])
         self._update_swing_levels(ctx)
-        level_high = _nearest_above(self._swing_highs_cache, close)
-        level_low = _nearest_below(self._swing_lows_cache, close)
-        if level_high is None or level_low is None:
-            return None
+        highs, lows = self._swing_highs_cache, self._swing_lows_cache
 
-        sweep_idx, direction = find_sweep(h4, level_low, level_high, _SWEEP_LOOKBACK, self.min_pierce_pct)
-        if sweep_idx is None or direction is None:
-            return None
+        def range_at(body_low: float, body_high: float) -> tuple[float, float] | None:
+            level_high = _nearest_above(highs, body_high)
+            level_low = _nearest_below(lows, body_low)
+            if level_high is None or level_low is None:
+                return None
+            return level_low, level_high
+
         # `_last_signalled_sweep` is an absolute 4H bar_index (trimming-safe); translate it
         # back to a row via `offset_of` rather than comparing raw rows, which trimming
         # reassigns to different bars over time - a raw-row comparison could coincidentally
@@ -319,16 +383,15 @@ class ICT:
         last_signalled_row = (
             ctx.offset_of(self._last_signalled_sweep) if self._last_signalled_sweep is not None else None
         )
-        if sweep_idx == last_signalled_row:
+        sweep_idx, direction = find_sweep_against(h4, range_at, _SWEEP_LOOKBACK, self.min_pierce_pct)
+        if sweep_idx is None or direction is None or sweep_idx == last_signalled_row:
             return None
 
         bos_idx, _neckline, _swing_extreme = find_bos(
             h4, sweep_idx, direction, self.min_bos_pct, self.mss_within
         )
-        if bos_idx is None:
-            return None
         current_idx = h4.shape[0] - 1
-        if bos_idx != current_idx:
+        if bos_idx is None or bos_idx != current_idx:
             return None
 
         # Confirmed setup: never re-emit for this sweep again, whatever happens below. Stored

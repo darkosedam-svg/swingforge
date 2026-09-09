@@ -20,7 +20,14 @@ import pytest
 
 from swingforge.core.context import Context
 from swingforge.core.types import Bar, Instrument, Signal
-from swingforge.strategies.ict import ICT, find_bos, find_fvg, find_order_block, find_sweep
+from swingforge.strategies.ict import (
+    ICT,
+    find_bos,
+    find_fvg,
+    find_order_block,
+    find_sweep,
+    find_sweep_against,
+)
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
@@ -546,13 +553,209 @@ def test_last_signalled_sweep_never_wrongly_suppresses_a_later_unrelated_sweep()
     assert strategy._last_signalled_sweep == 40  # the second sweep's own absolute bar_index
 
 
+# --- the liquidity range is judged per candidate bar, not from the current close ------------
+
+
+def _push_daily_rows(ctx: Context, rows: list[tuple[float, float, float, float, float]]) -> None:
+    start = datetime(2025, 12, 20, tzinfo=UTC)
+    for i, (o, h, low, c, v) in enumerate(rows):
+        ctx.push(
+            Bar(
+                instrument=INSTRUMENT,
+                tf="1d",
+                ts_open=start + timedelta(days=i),
+                open=o,
+                high=h,
+                low=low,
+                close=c,
+                volume=v,
+            )
+        )
+
+
+_TWO_LOW_DAILY = [
+    (100.0, 104.0, 92.0, 100.0, 1.0),
+    (100.0, 103.0, 91.0, 100.0, 1.0),
+    (100.0, 103.0, 90.0, 100.0, 1.0),  # swing low 90
+    (100.0, 104.0, 91.0, 100.0, 1.0),
+    (100.0, 115.0, 93.0, 100.0, 1.0),  # swing high 115
+    (106.0, 110.0, 106.0, 108.0, 1.0),
+    (108.0, 111.0, 106.0, 109.0, 1.0),
+    (108.0, 110.0, 105.0, 109.0, 1.0),  # swing low 105 - the pivot the displacement crosses
+    (109.0, 112.0, 107.0, 110.0, 1.0),
+    (110.0, 112.0, 107.0, 110.0, 1.0),
+    (110.0, 113.0, 108.0, 111.0, 1.0),
+    (111.0, 113.0, 108.0, 112.0, 1.0),
+]
+"""Daily bars whose confirmed fractal pivots are exactly lows [90, 105] and highs [115]."""
+
+
+def test_displacement_through_the_next_daily_pivot_keeps_its_own_sweep() -> None:
+    """A sweep of 90 (range [90, 115]) followed by a displacement that closes above the next
+    Daily swing low (105) and then breaks structure. At the BOS bar the *current* close sits
+    in [105, 115], so a range read off the current close no longer contains the sweep bar and
+    the setup is lost - the defect measured on real BTC/ETH bars (2026-09-07 run, where the
+    accumulated Daily pivots are ~2.5% apart and this happens on ~45% of bars). Each
+    candidate bar must be judged against the range around its own body: the sweep
+    still counts and the setup fires on the BOS bar, exactly once.
+    """
+    rows = _quiet_h4_rows(30) + [
+        (101.0, 102.0, 88.0, 100.0, 1.0),  # idx30: sweep of 90 (bearish -> OB), close in [90, 115]
+        (100.0, 104.0, 99.5, 103.0, 1.0),  # idx31: i=0, still inside [90, 115]
+        (103.0, 109.0, 102.5, 108.0, 1.0),  # idx32: i=1, closes above 105 -> current range moves
+        (108.0, 112.0, 107.5, 111.0, 1.0),  # idx33: i=2, BOS (close > 109 neckline)
+    ]
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _TWO_LOW_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals[:-1] == [None] * (len(rows) - 1)
+    signal = signals[-1]
+    assert signal is not None
+    assert signal.direction == 1
+    assert signal.entry == pytest.approx(100.5)  # the sweep candle's own body midpoint
+    assert signal.stop == pytest.approx(87.99)  # below the sweep low
+    assert signal.structure_target == pytest.approx(115.0)
+    assert signal.tag == "ict_sweep_mss_ob"
+
+
+def test_find_sweep_against_judges_each_bar_by_the_range_its_body_traded_in() -> None:
+    """`find_sweep_against(bars, range_at, ...)`: `range_at(body_low, body_high)` supplies the
+    range for the bar being examined. A bar that lies outside the newest bar's range is still
+    a sweep of its own range; a bar whose own range is undefined (None) is skipped."""
+
+    def range_at(body_low: float, body_high: float) -> tuple[float, float] | None:
+        if body_low < 90.0:
+            return None
+        return (90.0, 115.0) if body_high <= 115.0 else (115.0, 130.0)
+
+    inside = [(102.0, 103.0, 101.0, 102.0, 1.0) for _ in range(10)]
+    bars = _ohlcv(
+        inside
+        + [
+            (101.0, 102.0, 88.0, 100.0, 1.0),  # sweep of 90, range [90, 115]
+            (120.0, 124.0, 119.0, 123.0, 1.0),  # newest bar sits in [115, 130], no pierce
+        ]
+    )
+    idx, direction = find_sweep_against(bars, range_at, lookback=12, min_pierce_pct=0.0003)
+    assert idx == 10 and direction == 1
+
+    # Newest-first: a later sweep, of whichever range, is returned before an earlier one.
+    bars2 = _ohlcv(inside + [(101.0, 102.0, 88.0, 100.0, 1.0), (120.0, 131.0, 119.0, 123.0, 1.0)])
+    idx2, direction2 = find_sweep_against(bars2, range_at, lookback=12, min_pierce_pct=0.0003)
+    assert idx2 == 11 and direction2 == -1
+
+    # An undefined range for a bar's body skips that bar rather than raising.
+    bars3 = _ohlcv(inside + [(85.0, 86.0, 80.0, 85.0, 1.0)])
+    assert find_sweep_against(bars3, range_at, lookback=12, min_pierce_pct=0.0003) == (None, None)
+
+
+_THREE_LEVEL_DAILY = [
+    (100.0, 105.0, 92.0, 100.0, 1.0),
+    (100.0, 104.0, 91.0, 100.0, 1.0),
+    (100.0, 103.0, 90.0, 100.0, 1.0),  # swing low 90
+    (100.0, 104.0, 91.0, 100.0, 1.0),
+    (100.0, 115.0, 92.0, 100.0, 1.0),  # swing high 115
+    (100.0, 104.0, 93.0, 100.0, 1.0),
+    (100.0, 103.0, 93.0, 100.0, 1.0),
+    (100.0, 120.0, 93.0, 100.0, 1.0),
+    (100.0, 130.0, 94.0, 100.0, 1.0),  # swing high 130
+    (100.0, 120.0, 94.0, 100.0, 1.0),
+    (100.0, 103.0, 94.0, 100.0, 1.0),
+    (100.0, 104.0, 95.0, 100.0, 1.0),
+]
+"""Daily bars whose confirmed fractal pivots are exactly lows [90] and highs [115, 130]."""
+
+
+_HIGH_BETWEEN_CLOSE_AND_OPEN_DAILY = [
+    (100.0, 104.0, 92.0, 100.0, 1.0),
+    (100.0, 103.0, 91.0, 100.0, 1.0),
+    (100.0, 101.5, 90.0, 100.0, 1.0),  # swing low 90
+    (100.0, 101.0, 91.0, 100.0, 1.0),
+    (100.0, 102.0, 93.0, 100.0, 1.0),  # swing high 102 - sits inside the sweep candle's body
+    (100.0, 101.0, 93.0, 100.0, 1.0),
+    (100.0, 101.0, 93.0, 100.0, 1.0),
+    (100.0, 110.0, 93.0, 100.0, 1.0),
+    (100.0, 115.0, 94.0, 100.0, 1.0),  # swing high 115
+    (100.0, 110.0, 94.0, 100.0, 1.0),
+    (100.0, 103.0, 94.0, 100.0, 1.0),
+    (100.0, 104.0, 95.0, 100.0, 1.0),
+]
+"""Daily bars whose confirmed fractal pivots are exactly lows [90] and highs [102, 115]."""
+
+
+def test_range_is_anchored_on_the_sweep_candles_body_not_its_close() -> None:
+    """The sweep candle opens at 103 and closes at 101 with a confirmed swing high at 102 in
+    between. A range read around its *close* is [90, 102], which its open lies outside, so the
+    open-inside guard would reject a genuine sweep of 90; the range around its *body* is
+    [90, 115] and the sweep stands. This is the single decision that recovered most of the
+    planted setups in the integration suite.
+    """
+    rows = _quiet_h4_rows(30) + [
+        (103.0, 103.5, 88.0, 101.0, 1.0),  # idx30: sweep of 90, body [101, 103] straddles 102
+        (101.0, 104.0, 100.5, 103.5, 1.0),  # idx31: i=0
+        (103.5, 105.0, 103.0, 104.5, 1.0),  # idx32: i=1
+        (104.5, 108.0, 104.0, 107.0, 1.0),  # idx33: i=2, BOS (close > 105 neckline)
+    ]
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _HIGH_BETWEEN_CLOSE_AND_OPEN_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals[:-1] == [None] * (len(rows) - 1)
+    signal = signals[-1]
+    assert signal is not None
+    assert signal.direction == 1
+    assert signal.entry == pytest.approx(102.0)  # idx30's own body midpoint
+    assert signal.stop == pytest.approx(87.99)
+
+
+def test_a_pullback_candle_that_opened_outside_the_range_is_not_a_sweep_in_on_bar() -> None:
+    """The v0.3 pullback case, pinned on the strategy's own path. After a displacement out of
+    [90, 115] a pullback candle opens at 118 (outside), wicks to 113 and closes back at 114; a
+    bullish candle then supplies an order block and two falling bars break a short's neckline.
+    Read against the range around the current close, that candle's high (118.5) would be a
+    sweep of 115 and a short would fire on idx34. Its body [114, 118] anchors a range [90, 130]
+    instead, which nothing pierces: no signal, in either direction, on any bar. (On this path
+    the explicit open-inside check is inert by construction; the body anchor is the guard.)
+    """
+    rows = _quiet_h4_rows(30) + [
+        (112.0, 119.0, 111.5, 118.0, 1.0),  # idx30: displacement closes above 115
+        (118.0, 118.5, 113.0, 114.0, 1.0),  # idx31: pullback - opened outside, closed inside
+        (112.5, 114.5, 112.0, 114.0, 1.0),  # idx32: i=0 for a would-be short; bullish -> an OB
+        (114.0, 114.2, 111.0, 111.5, 1.0),  # idx33: i=1
+        (111.5, 112.0, 109.0, 109.5, 1.0),  # idx34: i=2, would break a short's neckline
+    ]
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _THREE_LEVEL_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals == [None] * len(rows)
+
+
 # --- performance (C1): the Daily swing-level cache must be incremental ----------------------
 
 
 def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
-    """Pushing ~4 years of bars (8,760 4H + 1,460 Daily) through `on_bar` must complete well
-    under the generous 5s budget - a regression to recomputing the Daily swing-level cache
-    from scratch on every 4H bar (O(n^2) over the run) takes well over 60s instead."""
+    """Pushing eight years of bars (17,520 4H + 2,920 Daily) through `on_bar` must complete
+    well under the 5s budget. The Daily series oscillates every ~6 days so several hundred
+    pivots accumulate per side: a regression to a linear scan of the level caches for each
+    of the up-to-twelve `range_at` lookups per bar measures ~11s here (bisection ~2s), and a
+    regression to rebuilding the cache from scratch every bar takes minutes."""
     ctx = Context(INSTRUMENT)
     strategy = ICT()
     start = datetime(2020, 1, 1, tzinfo=UTC)
@@ -561,13 +764,13 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
             instrument=INSTRUMENT,
             tf="1d",
             ts_open=start + timedelta(days=i),
-            open=100.0 + math.sin(i / 23.0) * 5.0,
-            high=100.0 + math.sin(i / 23.0) * 5.0 + 2.0,
-            low=100.0 + math.sin(i / 23.0) * 5.0 - 2.0,
-            close=100.0 + math.sin(i / 23.0) * 5.0,
+            open=100.0 + math.sin(i / 1.0) * 5.0,
+            high=100.0 + math.sin(i / 1.0) * 5.0 + 2.0,
+            low=100.0 + math.sin(i / 1.0) * 5.0 - 2.0,
+            close=100.0 + math.sin(i / 1.0) * 5.0,
             volume=1.0,
         )
-        for i in range(1_460)
+        for i in range(2_920)
     ]
     h4_bars = [
         Bar(
@@ -580,7 +783,7 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
             close=100.0 + math.sin(i / 40.0) * 5.0,
             volume=1.0,
         )
-        for i in range(8_760)
+        for i in range(17_520)
     ]
 
     daily_iter = iter(daily_bars)
@@ -594,4 +797,4 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
         strategy.on_bar(ctx)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 5.0, f"ICT.on_bar took {elapsed:.2f}s for 8,760 4H bars (budget: 5s)"
+    assert elapsed < 5.0, f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars (budget: 5s)"
