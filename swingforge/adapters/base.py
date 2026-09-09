@@ -151,5 +151,10 @@ class ExitResolver(Protocol):
         order — so a Partial's first target yields `Fill(leg="partial")` and the runner's
         target yields `Fill(leg="target")`. Time stops are submitted as `kind="market"`
         orders and never reach the resolver.
+
+        On the bar a trade entered on, `PaperBroker` passes a clipped view of the bar - the
+        candles before the entry dropped, the entry candle read pessimistically - so this
+        method never has to know where inside the bar the entry happened (see
+        `swingforge.adapters.paper._from_entry_onward`).
         """
         ...

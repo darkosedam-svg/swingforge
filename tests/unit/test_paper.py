@@ -1,8 +1,9 @@
 """Tests for `swingforge.adapters.paper.PaperBroker`.
 
-Uses a small fake `ExitResolver` (pessimistic: stop checked before each remaining target;
-honours `stop_after_partial`; records the kwargs it was called with) instead of the real
-`FillResolver`, which lives in another work unit's tree.
+The bookkeeping tests drive the broker with a small fake `ExitResolver` (pessimistic: stop
+checked before each remaining target; honours `stop_after_partial`; records the kwargs it was
+called with). The same-bar-entry block at the end uses the real `FillResolver`, because
+those tests are about what the resolver is shown.
 """
 
 from __future__ import annotations
@@ -17,10 +18,12 @@ import pytest
 
 from swingforge.adapters.base import Broker
 from swingforge.adapters.paper import PaperBroker
+from swingforge.core.fills import FillResolver
 from swingforge.core.types import (
     Bar,
     CostBreakdown,
     ExitEvent,
+    Fill,
     Instrument,
     Order,
     Position,
@@ -174,6 +177,219 @@ class FakeExitResolver:
                 effective_stop = stop_after_partial
             idx += 1
         return Resolution(events=tuple(events), mode="pessimistic")
+
+
+# -- same-bar entries: exits may only resolve against the bar from the entry onward ---------
+
+
+def _bar_with_subbars(ts_open: datetime, subbars: list[tuple[float, float, float, float]]) -> Bar:
+    """A 4H bar tiled by 1H subbars given as (open, high, low, close), oldest first."""
+    subs = tuple(
+        Bar(
+            instrument=BTC,
+            tf="1h",
+            ts_open=ts_open + timedelta(hours=i),
+            open=o,
+            high=h,
+            low=low,
+            close=c,
+            volume=1.0,
+        )
+        for i, (o, h, low, c) in enumerate(subbars)
+    )
+    return Bar(
+        instrument=BTC,
+        tf="4h",
+        ts_open=ts_open,
+        open=subs[0].open,
+        high=max(sub.high for sub in subs),
+        low=min(sub.low for sub in subs),
+        close=subs[-1].close,
+        volume=float(len(subs)),
+        subbars=subs,
+    )
+
+
+def _enter_long_then_attach(
+    broker: PaperBroker, bar: Bar, *, entry: float, stop: float, target: float
+) -> tuple[Fill, list[Fill]]:
+    """Submit a long limit at `entry`, run the entry bar, attach stop/target, run it again."""
+    broker.submit(_entry("e1", kind="limit", price=entry, trade_id="t1"))
+    first = broker.on_bar(bar, 0)
+    assert [f.leg for f in first] == ["entry"]
+    broker.submit(_leg("stop1", "t1", "stop", direction=-1, kind="stop", price=stop))
+    broker.submit(_leg("tgt1", "t1", "target", direction=-1, kind="limit", price=target))
+    return first[0], broker.on_bar(bar, 0)
+
+
+def test_a_target_touched_before_the_entry_subbar_does_not_fill() -> None:
+    """The first subbar runs to 112 (through the 110 target) before the limit at 100 is ever
+    touched in the second. A trade cannot exit at a price that traded before it existed;
+    resolving the whole bar against the freshly attached legs did exactly that."""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 112.0, 103.0, 105.0),  # through the target, entry not yet touched
+            (105.0, 106.0, 99.0, 101.0),  # entry 100 touched here
+            (101.0, 103.0, 100.5, 102.0),
+            (102.0, 104.0, 101.0, 103.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    entry_fill, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert entry_fill.price == 100.0
+    assert exits == []
+    assert len(broker.positions()) == 1
+
+
+def test_a_short_target_touched_before_the_entry_subbar_does_not_fill() -> None:
+    """The mirror of the long case, and the shape of the trade that exposed the defect: a
+    short limit at 108 with the target at 105 below. The first subbar opened at 104.5 -
+    below the target - before the limit was ever touched in the second; the old whole-bar
+    resolution filled the target at that pre-entry open."""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.5, 106.0, 104.0, 105.5),  # opened below the target, entry not yet touched
+            (105.5, 109.0, 105.0, 107.0),  # short limit 108 touched here
+            (107.0, 108.5, 106.0, 107.5),
+            (107.5, 108.0, 106.5, 107.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+    broker.submit(_entry("e1", direction=-1, kind="limit", price=108.0, trade_id="t1"))
+    first = broker.on_bar(bar, 0)
+    assert [f.leg for f in first] == ["entry"] and first[0].price == 108.0
+    broker.submit(_leg("stop1", "t1", "stop", direction=1, kind="stop", price=112.0))
+    broker.submit(_leg("tgt1", "t1", "target", direction=1, kind="limit", price=105.0))
+
+    exits = broker.on_bar(bar, 0)
+
+    assert exits == []
+    assert len(broker.positions()) == 1
+
+
+def test_a_candle_reaching_the_stop_has_already_filled_the_entry_and_stops_it_out() -> None:
+    """A long limit sits above its stop, so any candle that reaches the stop reached the entry
+    first: the entry fills in that candle and the stop then fills there too, pessimistically,
+    at the level (the candle's range cannot be split any finer). Holds before and after the
+    fix; it guards against over-correcting by dropping the entry candle's adverse range."""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 105.0, 94.0, 104.5),  # through both the entry (100) and the stop (95)
+            (104.5, 106.0, 103.0, 105.0),
+            (105.0, 107.0, 104.5, 106.0),
+            (106.0, 108.0, 105.0, 107.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    entry_fill, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert entry_fill.price == 100.0
+    assert [f.leg for f in exits] == ["stop"]
+    assert exits[0].price == 95.0
+    assert broker.positions() == []
+
+
+def test_the_entry_subbars_own_range_resolves_stop_first_at_the_level() -> None:
+    """After the entry, the entry subbar is read pessimistically: it touched both the stop
+    and the target, so the stop wins - and it fills at the level, never at that subbar's
+    open, because the legs were not live when it opened. (Holds before and after the fix:
+    it guards against over-correcting by dropping the entry candle's adverse range.)"""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 105.0, 103.0, 104.5),
+            (104.5, 111.0, 94.0, 101.0),  # entry 100, stop 95 and target 110 all inside
+            (101.0, 103.0, 100.5, 102.0),
+            (102.0, 104.0, 101.0, 103.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    _, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert [f.leg for f in exits] == ["stop"]
+    assert exits[0].price == 95.0
+    assert broker.positions() == []
+
+
+def test_a_target_inside_the_entry_subbar_does_not_fill_there() -> None:
+    """The entry subbar ran to 111 (through the 110 target) - but a 1H candle cannot say
+    whether that came before or after the 100 entry, so pessimistically it did not count. The
+    target is only creditable from the next candle on; here the later candles never reach it."""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 105.0, 103.0, 104.5),
+            (104.5, 111.0, 99.0, 101.0),  # entry 100 and target 110 inside, stop untouched
+            (101.0, 103.0, 100.5, 102.0),
+            (102.0, 104.0, 101.0, 103.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    _, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert exits == []
+    assert len(broker.positions()) == 1
+
+
+def test_a_target_reached_in_the_candle_after_the_entry_fills_at_the_level() -> None:
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 105.0, 103.0, 104.5),
+            (104.5, 106.0, 99.0, 101.0),  # entry 100
+            (101.0, 111.0, 100.5, 108.0),  # target 110 reached here, after the entry
+            (108.0, 109.0, 107.0, 108.5),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    _, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert [f.leg for f in exits] == ["target"]
+    assert exits[0].price == 110.0
+
+
+def test_a_limit_gapped_through_by_a_later_subbar_fills_at_that_subbars_open() -> None:
+    """The bar opened above the limit; the second subbar opened below it. The first price
+    available to the order is that subbar's open, not the limit (and not the bar's open)."""
+    bar = _bar_with_subbars(
+        TS0,
+        [
+            (104.0, 105.0, 103.0, 104.0),
+            (98.0, 99.0, 97.0, 98.5),  # gaps through the 100 limit at its open
+            (98.5, 101.0, 98.0, 100.5),
+            (100.5, 102.0, 100.0, 101.0),
+        ],
+    )
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+    broker.submit(_entry("e1", kind="limit", price=100.0, trade_id="t1"))
+
+    fills = broker.on_bar(bar, 0)
+
+    assert [f.leg for f in fills] == ["entry"]
+    assert fills[0].price == 98.0
+
+
+def test_without_subbars_the_entry_bar_credits_no_target() -> None:
+    """A bar that opened at 112 and later dipped to the 100 limit: its high (113) may have
+    come before the entry, so no target fills on the entry bar - neither at the level nor at
+    the bar's open under the gap rule, which the old whole-bar resolution credited. Only the
+    stop could fill on this bar."""
+    bar = Bar(instrument=BTC, tf="4h", ts_open=TS0, open=112.0, high=113.0, low=99.0, close=103.0, volume=1.0)
+    broker = PaperBroker(FakeCostModel(), FillResolver())
+
+    _, exits = _enter_long_then_attach(broker, bar, entry=100.0, stop=95.0, target=110.0)
+
+    assert exits == []
+    assert len(broker.positions()) == 1
 
 
 # -- protocol conformance -----------------------------------------------------

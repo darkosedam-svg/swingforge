@@ -229,7 +229,8 @@ class Engine:
             if fill.leg == "entry":
                 self._open_trade(fill, bar, bar_index)
                 # Same-bar re-evaluation: the just-attached stop/target may also fall
-                # inside this same bar's range. The broker resolves that pessimistically.
+                # inside this same bar's range. The broker resolves that pessimistically,
+                # against the bar from the entry candle onward (see `PaperBroker`).
                 closed.extend(self._handle_fills(self.broker.on_bar(bar, bar_index), bar, bar_index))
             else:
                 trade = self._apply_exit_fill(fill, bar, bar_index)

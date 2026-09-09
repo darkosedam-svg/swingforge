@@ -1,5 +1,9 @@
 """`PaperBroker`: one `Broker` implementation for both venues (design spec section 5).
 
+Same-bar entries: the exit legs the engine attaches after an entry fill are resolved only
+against the part of that bar the trade lived through (`_from_entry_onward`) - the candles
+before the entry candle are dropped and the entry candle is read pessimistically.
+
 Wraps a `CostModel` for execution costs and carry, and an `ExitResolver` (typically
 `swingforge.core.fills.FillResolver`, but any conforming implementation) for deciding which
 exit leg a bar hit and in what order. State machine per pending order is
@@ -69,6 +73,11 @@ class _TradeState:
     direction: Literal[1, -1]
     entry_price: float
     entry_qty: float
+    entry_bar_ts: datetime
+    """`ts_open` of the bar the entry filled on: exits resolved on that same bar may only see
+    the bar from the entry onward (see `_from_entry_onward`)."""
+    entry_candle: int
+    """Index into that bar's `subbars` (0 when it has none) of the candle the entry filled in."""
     filled_qty: float = 0.0
     accrued_carry: float = 0.0
 
@@ -83,6 +92,45 @@ class _TradeState:
 
 def _bar_close(bar: Bar) -> datetime:
     return bar.ts_open + _TF_SPAN[bar.tf]
+
+
+def _from_entry_onward(bar: Bar, state: _TradeState) -> Bar:
+    """`bar` as the trade that entered on it experienced it.
+
+    Candles that closed before the entry candle are dropped entirely. The entry candle
+    itself cannot be split any finer, so it is read pessimistically from the trade's point
+    of view: its `open` becomes the entry price (the first price available after the
+    entry, which lies between the stop and the target, so the resolver's gap rule cannot
+    credit a move that happened before the entry) and its favourable extreme is clipped to
+    the entry price too (a target it reached may have been reached before the entry, so no
+    target fills inside the entry candle), while its adverse extreme is kept (a stop it
+    reached is assumed to have been reached after the entry). Later candles are untouched.
+    Without subbars the whole bar is the entry candle. The parent bar's own OHLC is
+    recomputed from the remaining candles so the copy is consistent for any resolver, not
+    only one that reads `subbars` first; prices are clamped into the candle's range so the
+    copy stays a valid bar after tick rounding.
+    """
+    candles = bar.subbars or (bar,)
+    entry = candles[state.entry_candle]
+    open_ = min(max(state.entry_price, entry.low), entry.high)
+    if state.direction == 1:
+        close = min(entry.close, open_)
+        first = entry.model_copy(update={"open": open_, "high": max(open_, close), "close": close})
+    else:
+        close = max(entry.close, open_)
+        first = entry.model_copy(update={"open": open_, "low": min(open_, close), "close": close})
+    if not bar.subbars:
+        return first
+    remaining = (first, *candles[state.entry_candle + 1 :])
+    return bar.model_copy(
+        update={
+            "subbars": remaining,
+            "open": first.open,
+            "high": max(candle.high for candle in remaining),
+            "low": min(candle.low for candle in remaining),
+            "close": remaining[-1].close,
+        }
+    )
 
 
 class PaperBroker:
@@ -145,7 +193,9 @@ class PaperBroker:
 
         The engine does exactly that on an entry bar — once to learn the entry fill (so it
         can build the `Trade` and attach exit legs), and again, same `bar_index`, once those
-        legs are pending, to let them resolve against the rest of that same bar.
+        legs are pending, to let them resolve against the rest of that same bar - and only
+        the rest: `_from_entry_onward` drops the candles that closed before the entry and
+        reads the entry candle pessimistically (no target inside it, its stop still live).
 
         Engine invariant: a trade with pending target/partial legs must also carry a
         pending stop leg (every exit rule that attaches a target attaches a stop first) --
@@ -280,11 +330,28 @@ class PaperBroker:
     # -- entry fills ----------------------------------------------------------
 
     def _fill_entries(self, bar: Bar) -> list[Fill]:
+        """Fill every pending entry the bar touches, at the first candle that touches it.
+
+        With 1H subbars the entry is placed in the subbar that first reached the limit (and
+        a subbar that opened through the limit fills at its own open, the first price the
+        order could get), so the same-bar exit pass knows which part of the bar the trade
+        actually lived through. Without subbars the bar is the only candle. Subbars are
+        assumed to cover the parent's range (a `Bar` only validates that they lie inside
+        it); when they do not and only the parent touches the order, the parent fills it.
+        """
         fills: list[Fill] = []
+        candles = bar.subbars or (bar,)
         for order in [o for o in self._pending.values() if o.leg == "entry"]:
-            price = self._entry_fill_price(order, bar)
-            if price is None:
+            hit = self._first_touch(order, candles)
+            if hit is None and candles is not (bar,):
+                # Subbars are validated to lie inside the parent but not to cover it: if
+                # none touches the order while the bar as a whole does, fall back to the
+                # whole bar (as if it had no subbars) rather than silently never filling.
+                price = self._entry_fill_price(order, bar)
+                hit = None if price is None else (0, price)
+            if hit is None:
                 continue
+            entry_candle, price = hit
             fill = self._make_fill(order, bar, price, order.qty, "entry", carry_from=None)
             fills.append(fill)
             self._remove_pending(order.id)
@@ -294,11 +361,29 @@ class PaperBroker:
                     direction=order.direction,
                     entry_price=fill.price,
                     entry_qty=order.qty,
+                    entry_bar_ts=bar.ts_open,
+                    entry_candle=entry_candle,
                 )
         return fills
 
+    def _first_touch(self, order: Order, candles: tuple[Bar, ...]) -> tuple[int, float] | None:
+        """The (candle index, price) `order` first fills at, or None if no candle touches it."""
+        for index, candle in enumerate(candles):
+            price = self._entry_fill_price(order, candle)
+            if price is not None:
+                return index, price
+        return None
+
     @staticmethod
     def _entry_fill_price(order: Order, bar: Bar) -> float | None:
+        """The price `order` fills at inside one candle (a subbar, or the whole bar), or None.
+
+        A market order takes the candle's open (with subbars, the first subbar's open - which
+        is the bar's open on consistent venue data). A limit touched by the candle fills at
+        the better of the limit and the candle's open: a candle that opened through the limit
+        fills at its open, the first price the resting order could get, so a limit gapped
+        through by a LATER subbar fills better than the limit, never worse.
+        """
         if order.kind == "market":
             return bar.open
         if order.kind == "limit":
@@ -339,6 +424,8 @@ class PaperBroker:
         orders = self._orders_for_trade(trade_id)
         time_order = next((o for o in orders if o.leg == "time"), None)
         if time_order is not None:
+            # Fills at the bar's own open: a time stop is attached by the exit rule's manage
+            # path bars after the entry, never on the entry bar, so this is never a pre-entry price.
             fill = self._make_fill(time_order, bar, bar.open, state.remaining_qty, "time", carry_from=state)
             self._close_trade(trade_id)
             return [fill]
@@ -367,8 +454,11 @@ class PaperBroker:
         # so it can never still appear here as "pending" and trigger a second resolve.
         stop_after_partial = state.entry_price if any(o.leg == "partial" for o in target_orders) else None
 
+        # On the entry bar, only the part of the bar the trade lived through (`_from_entry_onward`).
         resolution = self._resolver.resolve(
-            bar,
+            _from_entry_onward(bar, state)
+            if state.entry_bar_ts == bar.ts_open and state.instrument == bar.instrument
+            else bar,
             stop_order.price,
             [o.price for o in target_orders if o.price is not None],
             state.direction,
@@ -425,7 +515,7 @@ class PaperBroker:
             carry_from.accrued_carry = 0.0
         fill = Fill(
             order_id=order.id,
-            # Bar close, even for an entry fill (the price computed from `bar.open`) -- a
+            # Bar close, even for an entry fill (priced off the touching candle's open) -- a
             # `Fill.ts` always marks when the *bar* closed, not the intrabar instant a
             # market/limit order would have actually touched, since replay only ever sees
             # bars after they've closed (see `ReplaySource`/`BarSource`, no lookahead).
