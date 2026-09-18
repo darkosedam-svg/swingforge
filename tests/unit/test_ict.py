@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -750,12 +751,20 @@ def test_a_pullback_candle_that_opened_outside_the_range_is_not_a_sweep_in_on_ba
 # --- performance (C1): the Daily swing-level cache must be incremental ----------------------
 
 
+def _line_tracing_active() -> bool:
+    """Whether coverage (or a debugger) is tracing every line, which slows this pure-Python
+    loop roughly threefold: `sys.settrace` for the C tracer, `sys.monitoring` for sysmon."""
+    return sys.gettrace() is not None or sys.monitoring.get_tool(sys.monitoring.COVERAGE_ID) is not None
+
+
 def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
     """Pushing eight years of bars (17,520 4H + 2,920 Daily) through `on_bar` must complete
     well under the 5s budget. The Daily series oscillates every ~6 days so several hundred
     pivots accumulate per side: a regression to a linear scan of the level caches for each
     of the up-to-twelve `range_at` lookups per bar measures ~11s here (bisection ~2s), and a
-    regression to rebuilding the cache from scratch every bar takes minutes."""
+    regression to rebuilding the cache from scratch every bar takes minutes. Under a line
+    tracer (`pytest --cov`) bisection itself measures ~5.3s, so the budget is tripled there;
+    it still sits below what the linear scan costs when traced."""
     ctx = Context(INSTRUMENT)
     strategy = ICT()
     start = datetime(2020, 1, 1, tzinfo=UTC)
@@ -797,4 +806,5 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
         strategy.on_bar(ctx)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 5.0, f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars (budget: 5s)"
+    budget = 15.0 if _line_tracing_active() else 5.0
+    assert elapsed < budget, f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars (budget: {budget:.0f}s)"
