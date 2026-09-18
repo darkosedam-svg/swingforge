@@ -8,7 +8,7 @@ Scope: research and paper trading only. Live order placement is a separate spec,
 
 All work units of the implementation plan are merged and verified:
 
-- 866 tests pass (2 contract tests skip until vcrpy cassettes are recorded), coverage 99% on `core` and `lab`.
+- 899 tests: 898 pass and one contract test skips until the OANDA cassette is recorded (the Hyperliquid one is). 27 of them are marked `slow` (the planted-edge integration controls and the performance budgets). Coverage is 99% on `core` and `lab`, 98% overall.
 - Import layering (`core` ← `strategies`/`adapters` ← `lab` ← `web`) is enforced by `import-linter` inside the test suite.
 - The planted-edge integration test shows the real ICT entry clearing all six gate rules while the random baseline never does, and nothing passes on edge-free or pure-random-walk data.
 
@@ -40,8 +40,10 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run pytest -q                      # fast suite
-uv run pytest -q -m slow              # integration and performance tests (~5 min)
+uv run pytest -q                      # everything, slow tests included (~3 min)
+uv run pytest -q -m "not slow"        # the fast loop
+uv run pytest -q -m slow              # only the integration controls and performance budgets (~1.5 min)
+uv run pytest -q --cov=swingforge     # with coverage (~7 min; line tracing slows the replay loops)
 uv run lint-imports && uv run ruff check . && uv run mypy swingforge
 ```
 
