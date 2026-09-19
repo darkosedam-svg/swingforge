@@ -8,11 +8,13 @@ Scope: research and paper trading only. Live order placement is a separate spec,
 
 All work units of the implementation plan are merged and verified:
 
-- 899 tests: 898 pass and one contract test skips until the OANDA cassette is recorded (the Hyperliquid one is). 27 of them are marked `slow` (the planted-edge integration controls and the performance budgets). Coverage is 99% on `core` and `lab`, 98% overall.
+- 939 tests: 938 pass and one contract test skips until the OANDA cassette is recorded (the Hyperliquid one is). 32 of them are marked `slow` (the planted-edge integration controls and the performance budgets). Coverage was 99% on `core` and `lab`, 98% overall, when last measured (2026-09-18).
 - Import layering (`core` ← `strategies`/`adapters` ← `lab` ← `web`) is enforced by `import-linter` inside the test suite.
-- The planted-edge integration test shows the real ICT entry clearing all six gate rules while the random baseline never does, and nothing passes on edge-free or pure-random-walk data.
+- The planted-edge integration test shows the real ICT entry clearing all six gate rules while the random baseline never does, and nothing passes on edge-free or pure-random-walk data - including five identical random walks pooled into one trial, which clear rule 1 and are read at one walk's worth of evidence.
 
 The Hyperliquid half of the runbook has been executed locally (2026-09-07, re-run 2026-09-09). The contract cassette is recorded, the store holds 8 instruments (27 months of 4H bars for BTC/ETH/SOL/ARB, the venue's retention limit; funding complete), and the tournament graded 744 trials: **none pass**. Every config fails rule 1. An adversarial investigation of the first run's low trade frequency cleared the engine and the port and found three strategy defects, all fixed and re-run: ICT re-anchored its liquidity range to the current close every bar (now the range around each candidate bar's own body); zones consumed freshness only on bars the engine consulted (now every bar); consecutive Daily impulses appended duplicate zones. The re-run also exposed and fixed a broker defect that predates everything: same-bar exits were resolved against sub-bars that traded before the entry, crediting phantom fills (ICT averaged +3R per trade on a pure random walk; now near zero). After the fixes ICT with no session filter produces about 19 in-sample trades per year and 12.5 out-of-sample per 15 months per config, the best out-of-sample count anywhere is 15 against the 60 required, and at the observed per-trade Sharpe rule 2 would still need 60 to 100 trades. No paper config is enabled. Per-run tables are in `docs/superpowers/handoffs/wu-2a.md`; the open strategy decision (walking every sweep candidate instead of newest-first) is recorded there with its measurements.
+
+Pooling the instruments (2026-09-19, run `tournament:hyperliquid:20260919`, 893 trials) gets past rule 1 for one family: ICT with no session filter holds 62 to 63 pooled out-of-sample trades across ARB, BTC, ETH, HYPE and SOL, entered on 54 to 55 distinct days, and all 16 of its exits clear the 60-trade floor. **Still none pass**, and no longer for want of trades: the best pooled expectancy is +0.10R (deflated-Sharpe probability 0.002 against 0.95, bootstrap 5th percentile -0.22R, below the pooled baseline), and the average over the exits is -0.13R. The session-filtered ICT arms read +0.13R and +0.19R on 37 and 18 pooled trades, and zones is negative everywhere; those remain sample-size verdicts. The fresh replay reproduced all 744 per-instrument rows of the 2026-09-09 run exactly. Tables, the dependence guard (rule 2 reads a pooled row at its entry days) and the open decision on rule 1 are in `docs/superpowers/handoffs/wu-2c.md`.
 
 Still human-only: OANDA credentials (cassette, backfill, tournament) and the VPS itself. See `deploy/README.md`.
 
@@ -40,10 +42,10 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run pytest -q                      # everything, slow tests included (~3 min)
+uv run pytest -q                      # everything, slow tests included (~5 min)
 uv run pytest -q -m "not slow"        # the fast loop
-uv run pytest -q -m slow              # only the integration controls and performance budgets (~1.5 min)
-uv run pytest -q --cov=swingforge     # with coverage (~7 min; line tracing slows the replay loops)
+uv run pytest -q -m slow              # only the integration controls and performance budgets (~3.5 min)
+uv run pytest -q --cov=swingforge     # with coverage (slower still; line tracing slows the replay loops)
 uv run lint-imports && uv run ruff check . && uv run mypy swingforge
 ```
 
