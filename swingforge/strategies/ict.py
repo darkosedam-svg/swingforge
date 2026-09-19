@@ -7,18 +7,19 @@ Asia session range, and the execution timeframe is 4H instead of 5m. The three v
 regression fixes described in that file's module docstring are preserved verbatim in the
 helpers below, since they are exactly what the fixtures in `tests/fixtures/ict_*.json` guard:
 
-* `find_sweep_against` (and its fixed-range form `find_sweep`) returns direction ``1``
-  (long) for a sweep of the range LOW and ``-1`` (short) for a sweep of the HIGH — the
-  reverse of the original, pre-v0.3 mapping. It also requires the sweep candle to have
-  *opened* inside the range, not just closed there, so a pullback candle after a
-  displacement that already left the range is not misread as a fresh sweep in the opposite
-  direction. Under the strategy's body-anchored range (below) that guard holds by
-  construction; the explicit check stays for the fixed-range shape the reference tests use.
+* `iter_sweeps_against` (with `find_sweep_against`, its first result, and the fixed-range
+  form `find_sweep`) returns direction ``1`` (long) for a sweep of the range LOW and ``-1``
+  (short) for a sweep of the HIGH — the reverse of the original, pre-v0.3 mapping. It also
+  requires the sweep candle to have *opened* inside the range, not just closed there, so a
+  pullback candle after a displacement that already left the range is not misread as a fresh
+  sweep in the opposite direction. Under the strategy's body-anchored range (below) that guard
+  holds by construction; the explicit check stays for the fixed-range shape the reference
+  tests use.
 * `find_bos`'s neckline is the extreme of the candles strictly BEFORE the current one:
   `running_high`/`running_low` is updated *after* the comparison on each iteration, not
   before, so a bar cannot clear its own just-updated extreme by a hair.
 
-The liquidity range is judged *per candidate bar*: `find_sweep_against` asks `range_at(body_low,
+The liquidity range is judged *per candidate bar*: `iter_sweeps_against` asks `range_at(body_low,
 body_high)` for the range around each lookback bar's own body - the nearest Daily swing low
 below the body and the nearest swing high above it, taken from the pivots confirmed as of the
 current bar (a pivot confirmed after the candidate closed but before now is information the
@@ -37,21 +38,44 @@ so its wick can only ever sweep a pivot on the correct side. The pierce threshol
 - a fraction of the newest close - while the range is per bar; at 0.03% the difference is
 immaterial.
 
-The scan itself keeps the reference's shape: newest-first, and `on_bar` gives up when the
-newest sweep has no break of structure yet. With pivot ranges, sweeps are frequent (roughly a
-fifth of all 4H bars on real data), so a newer sweep can shadow an older setup on the very bar
-it confirms - the second-largest loss the 2026-09-07 investigation measured. Walking every
-candidate and firing for the newest one whose break is the current bar recovers that, but it
-multiplies unplanted setups roughly 2.7x on the synthetic stores and is a separate strategy
-decision, recorded with its measurements in the WU-2A handoff rather than folded into this fix.
+`on_bar` walks the sweep candidates newest-first and fires for the newest one *whose break of
+structure is the current bar*. The reference stops at the newest sweep and gives up if it has
+no break yet, which is right for one fixed Asia range per day; with pivot ranges, sweeps are
+frequent (roughly a fifth of all 4H bars on real data), so a newer sweep with no break yet
+shadowed an older setup on the very bar it confirmed - the second-largest loss the 2026-09-07
+investigation measured. Adopted on 2026-09-19 as a deliberate strategy change, knowing what it
+costs: on the synthetic stores it multiplies the setups nobody planted roughly 2.7x (the WU-2A
+handoff has the measurements). A break can only land `_BOS_MIN_INDEX + 1` to `mss_within` bars
+after its sweep (`find_bos`), so those are the only bars the walk looks at (never further
+back than `_SWEEP_LOOKBACK`, as before): anything newer cannot be breaking yet, anything
+older no longer can.
+
+When several sweeps break on the same bar - about a fifth of the bars that fire at all - the
+newest wins: it is the last grab of liquidity before the break, the structure the break
+answers, and the reference prefers the newest sweep too. That choice also sets the stop,
+which sits beyond the chosen sweep's wick: the newer sweep's is the nearer one more often
+than not (median risk 0.89x the older candidate's on random-walk data), so at a fixed
+`risk_pct` the position is correspondingly larger.
+
+The walk is not free - on sweep-rich data it has nearly two candidates a bar to ask
+`find_bos` about, where the old scan asked about at most one - so a candidate is first put
+to `_closes_through_neckline`, the one-slice necessary condition for the current bar to be
+its break, and `find_bos` only confirms that no earlier bar got there first.
 
 One setup fires exactly once: `on_bar` requires the bar completing the break of structure to
-be the current (most recently pushed) 4H bar, and remembers `_last_signalled_sweep` so a
-sweep already signalled is never re-emitted even if a later bar's scan finds it again.
-`_last_signalled_sweep` is kept as an absolute 4H `bar_index`, not a row offset into
+be the current (most recently pushed) 4H bar, and for a given direction a sweep's break is
+the *first* bar that qualifies, which later bars never change. The direction is not quite
+fixed, though - it is re-read each bar against pivots that keep being confirmed, and the
+2026-09-19 review saw it flip on 3 of ~10,800 sweep bars - so fire-once does not lean on
+that argument: every sweep signalled within the lookback is remembered
+(`_signalled_sweeps`, pruned whenever one is added) and passed over, and a bar on which a
+setup has been found - whether or not an order block or gap then made a signal of it - is
+not asked for a second one.
+The signalled sweeps (and `_last_signalled_sweep`, the most recent of them) are kept as
+absolute 4H `bar_index` values, not row offsets into
 `ctx.bars("4h")`: row offsets are reassigned to different bars once trimming rotates the
 buffer, so a raw-row comparison could coincidentally match a later, unrelated sweep and
-wrongly suppress it. `Context.offset_of` translates it back to a row for the comparison.
+wrongly suppress it. `Context.offset_of` translates them back to rows for the comparison.
 
 The Daily swing-level cache (`_swing_highs_cache`/`_swing_lows_cache`, each kept sorted so a
 nearest-level lookup is a bisection - `range_at` runs up to twelve of them per 4H bar) is
@@ -68,7 +92,7 @@ advancing again.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right, insort
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterator
 from datetime import datetime
 from typing import Literal
 
@@ -85,8 +109,10 @@ __all__ = [
     "find_bos",
     "find_fvg",
     "find_order_block",
+    "find_setup_breaking_now",
     "find_sweep",
     "find_sweep_against",
+    "iter_sweeps_against",
 ]
 
 _SWEEP_LOOKBACK = 12
@@ -103,13 +129,15 @@ bar whose body spans `[body_low, body_high]` traded inside - the nearest Daily s
 the body and the nearest swing high above it - or None when no pivot exists on one side."""
 
 
-def find_sweep_against(
+def iter_sweeps_against(
     bars4h: np.ndarray,
     range_at: RangeAt,
     lookback: int,
     min_pierce_pct: float,
-) -> tuple[int | None, Literal[1, -1] | None]:
-    """Scan the last `lookback` bars, newest-first, for a sweep, judging each bar against
+    *,
+    skip_newest: int = 0,
+) -> Iterator[tuple[int, Literal[1, -1]]]:
+    """Every sweep among the last `lookback` bars, newest first, each bar judged against
     `range_at(body_low, body_high)` - the range around its own body (module docstring).
 
     A bar whose open AND close both lie inside its range and whose low pierces below
@@ -118,16 +146,18 @@ def find_sweep_against(
     `min_pierce_pct` of the most recent bar's close (the "current price"). The open-inside
     requirement is the v0.3 fix: without it a pullback candle that opened outside the range
     reads as a sweep in the wrong direction. A bar with no range (`range_at` -> None) is
-    skipped. Newest-first, as in the reference: the first sweep found wins, whichever range
-    it belongs to.
+    skipped. `skip_newest` leaves the newest that-many bars out of the scan (they still count
+    towards `lookback`, and the pierce is still measured against the newest close).
     """
+    if skip_newest < 0:
+        raise ValueError(f"skip_newest must be >= 0, got {skip_newest}")
     n = bars4h.shape[0]
     if n == 0:
-        return None, None
+        return
     price_ref = float(bars4h[-1, 3])
     min_pierce = price_ref * min_pierce_pct
     start = max(0, n - lookback)
-    for i in range(n - 1, start - 1, -1):
+    for i in range(n - 1 - skip_newest, start - 1, -1):
         open_, high, low, close = (float(x) for x in bars4h[i, :4])
         bounds = range_at(min(open_, close), max(open_, close))
         if bounds is None:
@@ -139,10 +169,20 @@ def find_sweep_against(
         if not inside:
             continue
         if low < level_low - min_pierce:
-            return i, 1
-        if high > level_high + min_pierce:
-            return i, -1
-    return None, None
+            yield i, 1
+        elif high > level_high + min_pierce:
+            yield i, -1
+
+
+def find_sweep_against(
+    bars4h: np.ndarray,
+    range_at: RangeAt,
+    lookback: int,
+    min_pierce_pct: float,
+) -> tuple[int | None, Literal[1, -1] | None]:
+    """The newest sweep `iter_sweeps_against` finds, or `(None, None)` - the reference's shape,
+    where the first sweep found wins, whichever range it belongs to."""
+    return next(iter_sweeps_against(bars4h, range_at, lookback, min_pierce_pct), (None, None))
 
 
 def find_sweep(
@@ -207,6 +247,61 @@ def find_bos(
             return idx, swing_high, min(running_low, low)
         running_low = min(running_low, low)
     return None, 0.0, 0.0
+
+
+def _closes_through_neckline(
+    bars4h: np.ndarray, sweep_idx: int, direction: Literal[1, -1], min_bos_pct: float
+) -> bool:
+    """Whether the newest bar closes, with a real body, through the neckline `find_bos` has
+    accumulated for `sweep_idx` by then - the running extreme of every bar from the sweep to
+    the one before the newest. Necessary for the newest bar to be that sweep's break, and one
+    slice to compute; not sufficient, because an earlier bar may have broken first.
+    """
+    open_, close = float(bars4h[-1, 0]), float(bars4h[-1, 3])
+    if close == open_:
+        return False
+    min_delta = float(bars4h[sweep_idx, 3]) * min_bos_pct
+    if direction == 1:
+        return close > float(bars4h[sweep_idx:-1, 1].max()) - min_delta
+    return close < float(bars4h[sweep_idx:-1, 2].min()) + min_delta
+
+
+def find_setup_breaking_now(
+    bars4h: np.ndarray,
+    range_at: RangeAt,
+    *,
+    mss_within: int,
+    min_pierce_pct: float,
+    min_bos_pct: float,
+    skip_rows: Collection[int] = (),
+) -> tuple[int, Literal[1, -1]] | None:
+    """The newest sweep whose break of structure is the newest bar, as `(sweep_idx,
+    direction)`, or None (module docstring). `skip_rows` are sweep rows to pass over.
+
+    `find_bos` can only place a break `_BOS_MIN_INDEX + 1` to `mss_within` bars after its
+    sweep, so the walk starts and stops there, never further back than `_SWEEP_LOOKBACK`: a
+    newer sweep cannot be breaking yet, an older one no longer can. With `mss_within` below
+    `_BOS_MIN_INDEX + 1` that window is empty and nothing ever fires - which is what
+    `find_bos` itself concludes for such a setting.
+    """
+    current_idx = bars4h.shape[0] - 1
+    candidates = iter_sweeps_against(
+        bars4h,
+        range_at,
+        min(_SWEEP_LOOKBACK, mss_within + 1),
+        min_pierce_pct,
+        skip_newest=_BOS_MIN_INDEX + 1,
+    )
+    for sweep_idx, direction in candidates:
+        if sweep_idx in skip_rows:
+            continue
+        if not _closes_through_neckline(bars4h, sweep_idx, direction, min_bos_pct):
+            continue
+        # the newest bar does break this sweep's structure; `find_bos` says whether it is the
+        # first bar to
+        if find_bos(bars4h, sweep_idx, direction, min_bos_pct, mss_within)[0] == current_idx:
+            return sweep_idx, direction
+    return None
 
 
 def find_fvg(
@@ -290,6 +385,8 @@ class ICT:
         self.min_pierce_pct = min_pierce_pct
         self.min_bos_pct = min_bos_pct
         self._last_signalled_sweep: int | None = None
+        self._signalled_sweeps: set[int] = set()
+        self._signal_bar: int | None = None
         self.rejected_signals = 0
         self._levels_last_daily_ts: datetime | None = None
         self._levels_marker_ts: datetime | None = None
@@ -297,9 +394,11 @@ class ICT:
         self._swing_lows_cache: list[float] = []
 
     def reset(self) -> None:
-        """Clear per-instance state: forgets the last sweep signalled and the Daily
+        """Clear per-instance state: forgets the sweeps signalled and the Daily
         swing-level cache."""
         self._last_signalled_sweep = None
+        self._signalled_sweeps = set()
+        self._signal_bar = None
         self.rejected_signals = 0
         self._levels_last_daily_ts = None
         self._levels_marker_ts = None
@@ -376,27 +475,35 @@ class ICT:
                 return None
             return level_low, level_high
 
-        # `_last_signalled_sweep` is an absolute 4H bar_index (trimming-safe); translate it
-        # back to a row via `offset_of` rather than comparing raw rows, which trimming
+        if ctx.bar_index == self._signal_bar:
+            return None  # this bar's setup is already resolved: a repeat call must not find another
+
+        # The signalled sweeps are absolute 4H bar_index values (trimming-safe); translate
+        # them back to rows via `offset_of` rather than comparing raw rows, which trimming
         # reassigns to different bars over time - a raw-row comparison could coincidentally
         # match a fresh, unrelated sweep and wrongly suppress it.
-        last_signalled_row = (
-            ctx.offset_of(self._last_signalled_sweep) if self._last_signalled_sweep is not None else None
+        skip_rows = {row for index in self._signalled_sweeps if (row := ctx.offset_of(index)) is not None}
+        setup = find_setup_breaking_now(
+            h4,
+            range_at,
+            mss_within=self.mss_within,
+            min_pierce_pct=self.min_pierce_pct,
+            min_bos_pct=self.min_bos_pct,
+            skip_rows=skip_rows,
         )
-        sweep_idx, direction = find_sweep_against(h4, range_at, _SWEEP_LOOKBACK, self.min_pierce_pct)
-        if sweep_idx is None or direction is None or sweep_idx == last_signalled_row:
+        if setup is None:
             return None
-
-        bos_idx, _neckline, _swing_extreme = find_bos(
-            h4, sweep_idx, direction, self.min_bos_pct, self.mss_within
-        )
-        current_idx = h4.shape[0] - 1
-        if bos_idx is None or bos_idx != current_idx:
-            return None
+        sweep_idx, direction = setup
+        bos_idx = h4.shape[0] - 1  # the current bar, by construction
 
         # Confirmed setup: never re-emit for this sweep again, whatever happens below. Stored
-        # as an absolute bar_index so it survives trimming (see the comment above).
+        # as absolute bar_index values so they survive trimming (see the comment above); a
+        # sweep that has left the lookback can no longer be a candidate and is forgotten.
         self._last_signalled_sweep = ctx.bar_index - (h4.shape[0] - 1 - sweep_idx)
+        horizon = ctx.bar_index - _SWEEP_LOOKBACK
+        self._signalled_sweeps = {index for index in self._signalled_sweeps if index > horizon}
+        self._signalled_sweeps.add(self._last_signalled_sweep)
+        self._signal_bar = ctx.bar_index
 
         fvg_end = min(bos_idx + _FVG_DISPLACEMENT_PAD, h4.shape[0])
         ob = find_order_block(h4, sweep_idx, bos_idx, direction)

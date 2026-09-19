@@ -232,8 +232,25 @@ def test_both_stores_offer_ict_the_same_entries(
     would have reached — so the drift only ever perturbs the Daily extremes inside its own
     window. That moves a handful of fractal pivots and so a handful of setups, which is why
     this is a tolerance rather than an equality.
+
+    The tolerance is 10% since `ICT` walks its sweep candidates (2026-09-19). Measured: 1,100
+    signals against 1,171, 6.1% apart. Every planted setup fires in the store it was planted
+    in (347 of 347, 363 of 363 - the plants themselves differ by 4.4%, and only 95 of their
+    break-of-structure bars are common to both); the rest are setups nobody planted, 753
+    against 808. The drift windows are the only place the two stores differ, so that is where
+    the gap comes from, but not which way it leans: under the newest-first scan there were
+    2.7x fewer unplanted setups (289 against 281), leaning the other way, and the totals sat
+    1.2% apart under a 5% bound.
+
+    The first assertion is the parity claim - the two searches run at nearly the same entry
+    frequency - and it is the one that was loosened. The second is not a substitute for it: it
+    says nothing across stores, only that within each store no planted opportunity is missed,
+    so a difference in outcome cannot come from one store's plant being taken less often.
     """
-    assert len(edge_signals) == pytest.approx(len(flat_signals), rel=0.05)
+    assert len(edge_signals) == pytest.approx(len(flat_signals), rel=0.10)
+    for signals, edge in ((edge_signals, True), (flat_signals, False)):
+        setups = planted_setups(PLANTED, years=PLANTED_YEARS, seed=PLANTED_SEED, edge=edge)
+        assert all(setup.bos_index in signals for setup in setups), f"edge={edge}"
 
 
 # --- the gate ------------------------------------------------------------------------
@@ -310,11 +327,14 @@ def test_nothing_passes_on_a_pure_random_walk(random_walk_result: TournamentResu
     frequency-matched `baseline` -- the planted-store tests above already show the search
     can't be fooled by a matched control; this shows it can't be fooled by chance alone.
 
-    An unplanted walk gives `ict` (and `baseline`, matched to its rate) too few OOS trades
-    over four years to ever clear rule 1's n>=60 floor -- observed counts are in the report
-    below. That floor doing its job is not itself proof the statistics would have rejected
-    the walk; the second assertion shows they do, by re-running the deflated-Sharpe rule
-    (rule 2) on the very same pooled OOS trades with the floor lifted.
+    Since `ICT` walks its sweep candidates (2026-09-19) an unplanted walk gives it some 240 OOS
+    trades over four years (16 under the newest-first scan), and the frequency-matched
+    `baseline` follows, so for those two rule 1's n>=60 floor is cleared and `passing == []`
+    is the statistics rejecting the walk, not the floor. (`zones` still stops at the floor,
+    on a handful of trades.) The rest of this test only runs if *no* `ict`/`baseline` config
+    clears the floor - as none did before the walk: it then re-runs the deflated-Sharpe rule
+    (rule 2) on the very same pooled OOS trades with the floor lifted, because the floor
+    doing its job is not proof that the statistics would have.
     """
     report = _report(random_walk_result, "pure random walk")
     print(report)
@@ -386,31 +406,42 @@ def test_pooling_clones_of_a_random_walk_passes_nothing(cloned_walk_result: Tour
 def test_a_pool_of_clones_is_read_at_one_clones_worth_of_evidence(
     cloned_walk_result: TournamentResult,
 ) -> None:
-    """The `ict` universe trials hold every trade `CLONES` times - enough to clear rule 1, which
-    one walk alone never does - and rule 2 must read them at the days they were entered on, not
-    at the row count: the deflated Sharpe comes out where one clone's own trades put it, and
-    reading the rows as independent trades would have put it somewhere else."""
+    """The `ict` universe trials hold every trade `CLONES` times, and rule 2 must read them at the
+    days they were entered on, not at the row count: the deflated Sharpe comes out where one
+    clone's own trades put it, and reading the rows as independent trades puts it far away.
+    (Each clone clears rule 1 by itself since `ICT` walks its sweep candidates, so the run
+    measures a `trial_sr_variance`; every reading below is taken at that same V.)"""
     result = cloned_walk_result
     report = _report(result, f"{CLONES} clones of a pure random walk")
     universe = [row for row in _pooled(result, "ict") if row["symbol"] == "*"]
     assert len(universe) >= len(CLONE_EXITS), report  # one per exit, plus a view if one was selected
     graded = [row for row in universe if row["g1"] is True]
     assert graded, f"no ict universe trial cleared rule 1, so this control proves nothing\n{report}"
-    # no single walk reaches rule 1's floor, so V is never measured and the gate falls back to
-    # the analytical 1/(n - 1) - at the effective size, for a universe trial
-    assert result.trial_sr_variance is None, report
 
+    variance = result.trial_sr_variance
     for row in graded:
         trades = result.oos_trades[row["config_id"]]
         one_clone = result.oos_trades[row["config_id"].replace(":*", ":WALK0")]
         gate = result.gates[row["config_id"]]
         assert gate.dsr is not None, report
         assert len(trades) == CLONES * len(one_clone), report
-        assert gate.dsr.effective_n == entry_days(trades) == entry_days(one_clone), report
+        assert entry_days(trades) == entry_days(one_clone) < len(trades), report
+        # the gate's reading is exactly the pooled series taken at one clone's entry days
+        assert gate.dsr == deflated_sharpe(
+            realized_rs(trades),
+            result.n_trials,
+            trial_sr_variance=variance,
+            effective_n=entry_days(one_clone),
+        ), report
 
-        alone = deflated_sharpe(realized_rs(one_clone), result.n_trials, effective_n=entry_days(one_clone))
-        naive = deflated_sharpe(realized_rs(trades), result.n_trials)
-        # equal up to the Sharpe's ddof, which a cloned sample shifts by about 3%
+        alone = deflated_sharpe(
+            realized_rs(one_clone),
+            result.n_trials,
+            trial_sr_variance=variance,
+            effective_n=entry_days(one_clone),
+        )
+        naive = deflated_sharpe(realized_rs(trades), result.n_trials, trial_sr_variance=variance)
+        # equal up to the Sharpe's ddof, which a cloned sample shifts by well under one percent
         assert gate.dsr.prob == pytest.approx(alone.prob, abs=0.05), report
         assert gate.dsr.sr_star == pytest.approx(alone.sr_star), report
         assert abs(naive.prob - alone.prob) > abs(gate.dsr.prob - alone.prob), report

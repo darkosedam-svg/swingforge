@@ -24,6 +24,8 @@ Follow-up fix: `_shown_rows`' top-`top_n` ranking now excludes `IS_SELECTED` row
 
 ## Re-run with universe trials (2026-09-19)
 
+_Measured before ICT's candidate walk was adopted later the same day. The walk roughly triples ICT's trade count, so the ICT figures below - and the 62-63 trades on 54-55 entry days the open decision on rule 1 is argued from - describe the newest-first scan. The run that follows the walk is in the WU-2A handoff._
+
 `tournament:hyperliquid:20260919`, a fresh replay of the same store on `main` at `7b0b710` (seed 0): 893 trials (744 per instrument and view, as before, plus 149 universe trials), `trial_sr_variance` `None`, **0 passed**. The 744 per-instrument pooled rows are identical to `tournament:hyperliquid:20260909` in every column compared (`n_is`, `n_oos`, `exp_is`, `exp_oos`, rule 1, verdict), so the replay is deterministic and pooling changed nothing underneath it. Members of every universe trial: ARB, BTC, ETH, HYPE, SOL.
 
 Per entry and session, averaged over the 16 enumerated exits (best single instrument before -> pooled now):

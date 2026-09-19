@@ -15,19 +15,23 @@ import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from swingforge.core.context import Context
 from swingforge.core.types import Bar, Instrument, Signal
+from swingforge.strategies import ict as ict_module
 from swingforge.strategies.ict import (
     ICT,
     find_bos,
     find_fvg,
     find_order_block,
+    find_setup_breaking_now,
     find_sweep,
     find_sweep_against,
+    iter_sweeps_against,
 )
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -283,11 +287,13 @@ def test_bos_neckline_boundary_signals_only_on_the_true_break() -> None:
 
 
 def test_a_signalled_sweep_is_never_re_emitted() -> None:
-    """`_last_signalled_sweep` guards against a re-scan finding the same old sweep again."""
+    """The signalled sweeps are remembered (`_signalled_sweeps`; `_last_signalled_sweep` is the
+    most recent) so a re-scan finding the same old sweep again passes it over."""
     strategy = ICT()
     results = _run_fixture("clean_sweep_mss_ob", strategy=strategy)
     fired_at = next(i for i, s in enumerate(results) if s is not None)
     assert strategy._last_signalled_sweep == 30  # the sweep bar's index
+    assert strategy._signalled_sweeps == {30}
     # Re-running on_bar again on the same, unchanged context must not re-signal.
     daily_bars, h4_bars = _load_fixture("clean_sweep_mss_ob")
     ctx = Context(INSTRUMENT)
@@ -301,8 +307,11 @@ def test_a_signalled_sweep_is_never_re_emitted() -> None:
 def test_reset_clears_last_signalled_sweep() -> None:
     strategy = ICT()
     strategy._last_signalled_sweep = 5
+    strategy._signalled_sweeps = {5}
+    strategy._signal_bar = 9
     strategy.reset()
     assert strategy._last_signalled_sweep is None
+    assert strategy._signalled_sweeps == set() and strategy._signal_bar is None
 
 
 # --- on_bar edge cases (built directly on the clean_sweep_mss_ob Daily levels) --------------
@@ -656,6 +665,217 @@ def test_find_sweep_against_judges_each_bar_by_the_range_its_body_traded_in() ->
     assert find_sweep_against(bars3, range_at, lookback=12, min_pierce_pct=0.0003) == (None, None)
 
 
+_SHADOWED_SETUP = [
+    (101.0, 102.0, 88.0, 100.0, 1.0),  # idx30: sweep A of 90 (bearish -> OB), range [90, 115]
+    (100.0, 104.0, 99.5, 103.0, 1.0),  # idx31: i=0
+    (103.0, 105.0, 102.5, 104.0, 1.0),  # idx32: i=1, running high 105
+    (103.5, 104.5, 88.5, 104.0, 1.0),  # idx33: i=2, a NEWER sweep B of 90, with no break yet
+    (103.5, 108.0, 103.0, 107.0, 1.0),  # idx34: i=3, BOS of A (close > 105); B has none
+]
+"""A sweep whose break of structure lands one bar after a newer sweep of the same level."""
+
+
+def test_a_newer_sweep_without_a_break_does_not_shadow_the_sweep_whose_break_is_now() -> None:
+    """Sweeps of the nearest Daily pivots are frequent (roughly a fifth of all 4H bars on real
+    data), so the newest sweep in the lookback is usually not the one whose structure is
+    breaking now. Scanning newest-first and giving up when that newest sweep has no BOS yet -
+    the reference's shape, written for one fixed Asia range per day - loses the older setup on
+    the very bar it confirms (the second-largest loss the 2026-09-07 investigation measured).
+    The current bar must fire for the newest sweep *for which it is the break of structure*.
+    """
+    rows = _quiet_h4_rows(30) + _SHADOWED_SETUP
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _TWO_LOW_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals[:-1] == [None] * (len(rows) - 1)
+    signal = signals[-1]
+    assert signal is not None
+    assert signal.direction == 1
+    assert signal.entry == pytest.approx(100.5)  # A's own body midpoint: the older sweep fired
+    assert signal.stop == pytest.approx(87.99)  # below A's low, not B's
+
+
+def test_each_sweep_fires_once_on_its_own_break_of_structure() -> None:
+    """The newer sweep is not lost either: it fires two bars later, on its own break, and the
+    sweep that already fired is passed over rather than fired again."""
+    rows = (
+        _quiet_h4_rows(30)
+        + _SHADOWED_SETUP
+        + [
+            (107.5, 108.0, 106.5, 107.0, 1.0),  # idx35: i=1 for B (bearish -> B's OB); running high 108
+            (107.0, 110.0, 106.8, 109.5, 1.0),  # idx36: i=2 for B, BOS (close > 108); A is 6 bars back
+            (109.5, 112.0, 109.0, 111.5, 1.0),  # idx37: another strong close - nothing left to fire
+        ]
+    )
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _TWO_LOW_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    fired = {i: signal for i, signal in enumerate(signals) if signal is not None}
+    assert sorted(fired) == [34, 36]
+    assert fired[34].stop == pytest.approx(87.99)  # A: below 88.0
+    assert fired[36].direction == 1
+    assert fired[36].stop == pytest.approx(88.49)  # B: below 88.5
+    assert fired[36].entry == pytest.approx(107.25)  # idx35's body midpoint, B's order block
+
+
+_TWO_SWEEPS_ONE_BREAK = [
+    (101.0, 102.0, 88.0, 100.0, 1.0),  # idx30: sweep A of 90 (low 88.0)
+    (100.0, 103.0, 88.5, 102.0, 1.0),  # idx31: sweep B of 90 (low 88.5), one bar later
+    (102.0, 105.0, 101.5, 104.0, 1.0),  # idx32: running high 105 for both
+    (104.0, 104.8, 103.0, 103.5, 1.0),  # idx33: bearish -> the order block of either setup
+    (103.5, 108.0, 103.0, 107.0, 1.0),  # idx34: closes above 105 - the break of A (i=3) AND of B (i=2)
+]
+"""Two sweeps whose break of structure is the same bar - a fifth of all firing bars on random-walk
+data, so which one wins is not a corner case."""
+
+
+def test_the_newest_of_two_sweeps_breaking_on_one_bar_wins() -> None:
+    """The newest sweep is the last grab of liquidity before the break, and its wick is the stop:
+    88.49 here, where the older sweep's would have been 87.99 (and the position smaller)."""
+    rows = _quiet_h4_rows(30) + _TWO_SWEEPS_ONE_BREAK
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _TWO_LOW_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals[:-1] == [None] * (len(rows) - 1)
+    signal = signals[-1]
+    assert signal is not None and signal.direction == 1
+    assert signal.stop == pytest.approx(88.49)  # B's wick, not A's 87.99
+    assert signal.entry == pytest.approx(103.75)  # idx33's body midpoint, either way
+    assert strategy._last_signalled_sweep == 31
+
+    # One bar, one signal: asked again about the same bar, the walk would pass B over, reach A -
+    # whose break is this bar too - and fire a second time.
+    assert strategy.on_bar(ctx) is None
+
+
+def test_the_walk_passes_over_a_newer_sweep_whose_break_is_not_now() -> None:
+    """The walk's own step: a candidate inside the window (three bars back, a sweep of the HIGH)
+    is put to the test, fails it - the bar closes up, not down - and the older long setup
+    behind it fires."""
+    rows = _quiet_h4_rows(30) + [
+        (101.0, 102.0, 88.0, 100.0, 1.0),  # idx30: sweep A of 90 -> long
+        (104.0, 116.0, 103.0, 105.0, 1.0),  # idx31: sweep B of 115 -> short; A's running high 116
+        (105.0, 110.0, 104.0, 109.0, 1.0),  # idx32
+        (109.0, 112.0, 108.0, 108.5, 1.0),  # idx33: bearish -> A's order block
+        (108.5, 118.0, 108.0, 117.5, 1.0),  # idx34: closes above 116 - A's break; B needs a close below 103
+    ]
+    ctx = Context(INSTRUMENT)
+    _push_daily_rows(ctx, _TWO_LOW_DAILY)
+    strategy = ICT()
+
+    signals = []
+    for i, row in enumerate(rows):
+        _push_h4_row(ctx, i, row)
+        signals.append(strategy.on_bar(ctx))
+
+    assert signals[:-1] == [None] * (len(rows) - 1)
+    signal = signals[-1]
+    assert signal is not None and signal.direction == 1
+    assert signal.stop == pytest.approx(87.99)  # below A's low
+    assert signal.entry == pytest.approx(108.75)
+    assert strategy._last_signalled_sweep == 30
+
+
+def _grid_range(body_low: float, body_high: float) -> tuple[float, float]:
+    """Whole numbers as liquidity levels: dense enough that a random walk sweeps them constantly."""
+    return math.ceil(body_low) - 1.0, math.floor(body_high) + 1.0
+
+
+def _walk_bars(n: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    closes = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.004, n)))
+    opens = np.concatenate([[100.0], closes[:-1]])
+    highs = np.maximum(opens, closes) * (1.0 + np.abs(rng.normal(0.0, 0.003, n)))
+    lows = np.minimum(opens, closes) * (1.0 - np.abs(rng.normal(0.0, 0.003, n)))
+    return np.column_stack([opens, highs, lows, closes, np.ones(n)])
+
+
+@pytest.mark.parametrize("mss_within", [2, 3, 6, 12])
+def test_find_setup_breaking_now_agrees_with_a_brute_force_walk(mss_within: int) -> None:
+    """The shipped walk looks only at the bars whose break can be now, and asks `find_bos` only
+    about candidates the newest bar closes through. Both shortcuts must change nothing: walking
+    every sweep of the whole lookback and asking `find_bos` about each gives the same answer."""
+    bars = _walk_bars(1_200, seed=3)
+    found = 0
+    for n in range(30, bars.shape[0] + 1):
+        window = bars[:n]
+        expected = next(
+            (
+                (sweep_idx, direction)
+                for sweep_idx, direction in iter_sweeps_against(window, _grid_range, 12, 0.0003)
+                if find_bos(window, sweep_idx, direction, 0.0002, mss_within)[0] == n - 1
+            ),
+            None,
+        )
+        got = find_setup_breaking_now(
+            window, _grid_range, mss_within=mss_within, min_pierce_pct=0.0003, min_bos_pct=0.0002
+        )
+        assert got == expected, n
+        found += got is not None
+    assert (found == 0) if mss_within < 3 else (found > 50)  # the comparison is about something
+
+
+def test_find_setup_breaking_now_passes_over_the_rows_it_is_told_to() -> None:
+    bars = _ohlcv(_quiet_h4_rows(30) + _TWO_SWEEPS_ONE_BREAK)
+
+    def range_at(_lo: float, _hi: float) -> tuple[float, float]:
+        return (90.0, 115.0)
+
+    kwargs = {"mss_within": 6, "min_pierce_pct": 0.0003, "min_bos_pct": 0.0002}
+    assert find_setup_breaking_now(bars, range_at, **kwargs) == (31, 1)
+    assert find_setup_breaking_now(bars, range_at, skip_rows={31}, **kwargs) == (30, 1)
+    assert find_setup_breaking_now(bars, range_at, skip_rows={30, 31}, **kwargs) is None
+
+
+def test_iter_sweeps_against_yields_every_sweep_newest_first() -> None:
+    """`find_sweep_against` is the first of these; `ICT.on_bar` walks them."""
+
+    def range_at(body_low: float, body_high: float) -> tuple[float, float] | None:
+        return (90.0, 115.0) if body_high <= 115.0 else (115.0, 130.0)
+
+    inside = [(102.0, 103.0, 101.0, 102.0, 1.0) for _ in range(10)]
+    bars = _ohlcv(
+        inside
+        + [
+            (101.0, 102.0, 88.0, 100.0, 1.0),  # idx10: sweep of 90 -> long
+            (120.0, 131.0, 119.0, 123.0, 1.0),  # idx11: sweep of 130 -> short
+        ]
+    )
+    assert list(iter_sweeps_against(bars, range_at, 12, 0.0003)) == [(11, -1), (10, 1)]
+    assert find_sweep_against(bars, range_at, 12, 0.0003) == (11, -1)
+    # `skip_newest` leaves out the bars too recent for their break to be the current one; the
+    # pierce is still measured against the newest close
+    assert list(iter_sweeps_against(bars, range_at, 12, 0.0003, skip_newest=1)) == [(10, 1)]
+    assert list(iter_sweeps_against(bars, range_at, 1, 0.0003)) == [(11, -1)]
+    assert list(iter_sweeps_against(bars[:0], range_at, 12, 0.0003)) == []
+    assert list(iter_sweeps_against(bars, range_at, 12, 0.0003, skip_newest=99)) == []
+    with pytest.raises(ValueError, match="skip_newest"):
+        list(iter_sweeps_against(bars, range_at, 12, 0.0003, skip_newest=-1))
+
+    # A bar that pierces both sides is a sweep of the low, once: yielded a second time as a
+    # short, the walk would go looking for a break in both directions from one candle.
+    both = _ohlcv([(100.0, 140.0, 60.0, 100.0, 1.0)])
+    assert list(iter_sweeps_against(both, lambda _lo, _hi: (90.0, 110.0), 12, 0.0003)) == [(0, 1)]
+
+
 _THREE_LEVEL_DAILY = [
     (100.0, 105.0, 92.0, 100.0, 1.0),
     (100.0, 104.0, 91.0, 100.0, 1.0),
@@ -808,3 +1028,66 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
 
     budget = 15.0 if _line_tracing_active() else 5.0
     assert elapsed < budget, f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars (budget: {budget:.0f}s)"
+
+
+def test_on_bar_stays_fast_when_sweeps_are_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The series above holds no sweep at all, so it times the scan and never the walk. This one
+    is an eight-year random walk with its own Daily bars, where the walk has a candidate or two
+    to put to `find_bos` on most bars - the regime the real venues are in. Measures ~3s.
+
+    The wall-clock budget only catches a gross regression, because a loaded machine moves it.
+    What keeps the walk as cheap as the scan it replaced is the neckline precheck, and that
+    is pinned by something load cannot move: how often `find_bos` is asked. 1,831 times for
+    1,472 signals here; 26,527 times (and 5s) if every candidate were put to it."""
+    calls = 0
+    real_find_bos = ict_module.find_bos
+
+    def counting_find_bos(*args: Any, **kwargs: Any) -> tuple[int | None, float, float]:
+        nonlocal calls
+        calls += 1
+        return real_find_bos(*args, **kwargs)
+
+    monkeypatch.setattr(ict_module, "find_bos", counting_find_bos)
+    bars = _walk_bars(17_520, seed=5)
+    ctx = Context(INSTRUMENT)
+    strategy = ICT()
+    start = datetime(2020, 1, 1, tzinfo=UTC)
+    signals = 0
+
+    started = time.perf_counter()
+    for i, (open_, high, low, close, volume) in enumerate(bars):
+        ctx.push(
+            Bar(
+                instrument=INSTRUMENT,
+                tf="4h",
+                ts_open=start + timedelta(hours=4 * i),
+                open=float(open_),
+                high=float(high),
+                low=float(low),
+                close=float(close),
+                volume=float(volume),
+            )
+        )
+        signals += strategy.on_bar(ctx) is not None
+        if i % 6 == 5:  # the day's last 4H bar has closed: its Daily bar follows, as in replay
+            day = bars[i - 5 : i + 1]
+            ctx.push(
+                Bar(
+                    instrument=INSTRUMENT,
+                    tf="1d",
+                    ts_open=start + timedelta(hours=4 * (i - 5)),
+                    open=float(day[0, 0]),
+                    high=float(day[:, 1].max()),
+                    low=float(day[:, 2].min()),
+                    close=float(day[-1, 3]),
+                    volume=6.0,
+                )
+            )
+    elapsed = time.perf_counter() - started
+
+    assert signals > 1_000, f"only {signals} signals: this series no longer exercises the walk"
+    assert calls < 2 * signals + 1_000, f"find_bos was asked {calls} times for {signals} signals"
+    budget = 30.0 if _line_tracing_active() else 10.0
+    assert elapsed < budget, (
+        f"ICT.on_bar took {elapsed:.2f}s for 17,520 sweep-rich 4H bars (budget: {budget:.0f}s)"
+    )
