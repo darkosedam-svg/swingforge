@@ -348,6 +348,13 @@ function gateRow(r) {
     + `<td>${fmt(r.exp_oos, 3)}</td></tr>`;
 }
 
+function universeRow(r) {
+  return `<tr><td>${esc(r.config_id)}</td><td>${esc(r.entry)}/${esc(r.exit)}</td><td>${r.n_oos ?? ""}</td>`
+    + `<td>${check(r.g1)}</td><td>${check(r.g2)}</td><td>${check(r.g3)}</td><td>${check(r.g4)}</td>`
+    + `<td>${check(r.g5)}</td><td>${check(r.g6)}</td><td>${check(r.passed)}</td>`
+    + `<td>${fmt(r.exp_oos, 3)}</td></tr>`;
+}
+
 function renderTournament(data) {
   if (data === null) {
     document.getElementById("tournament-body").innerHTML = '<div class="muted">no tournament results yet</div>';
@@ -358,6 +365,16 @@ function renderTournament(data) {
   html += "<h3>Gate</h3><table><thead><tr><th>config</th><th>entry/exit</th><th>symbol</th>"
     + "<th>g1</th><th>g2</th><th>g3</th><th>g4</th><th>g5</th><th>g6</th><th>passed</th><th>exp_oos</th></tr></thead><tbody>";
   html += data.gate.map(gateRow).join("") || '<tr><td colspan="11" class="muted">none</td></tr>';
+  html += "</tbody></table>";
+
+  html += "<h3>Gate, pooled across instruments</h3>"
+    + '<div class="muted">each entry, exit and session graded on every instrument of the venue together; '
+    + 'a pass is enabled per instrument; the markdown report names the instruments and the entry days'
+    + (data.universe_omitted ? ` &middot; ${data.universe_omitted} more in the results table` : '')
+    + '</div>'
+    + "<table><thead><tr><th>config</th><th>entry/exit</th><th>n_oos</th>"
+    + "<th>g1</th><th>g2</th><th>g3</th><th>g4</th><th>g5</th><th>g6</th><th>passed</th><th>exp_oos</th></tr></thead><tbody>";
+  html += (data.universe || []).map(universeRow).join("") || '<tr><td colspan="11" class="muted">none</td></tr>';
   html += "</tbody></table>";
 
   html += "<h3>Top configs (IS vs OOS)</h3><table><thead><tr><th>config</th><th>exp_is</th><th>exp_oos</th></tr></thead><tbody>";

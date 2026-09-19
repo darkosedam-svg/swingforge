@@ -209,7 +209,8 @@ class DSRResult(BaseModel):
     Sharpe of `n_trials` independent null strategies, and `prob` the probability that the
     true Sharpe exceeds that threshold - the number gate rule 2 thresholds at 0.95.
     `skew` and `kurt` are the population moments that enter the formula, `kurt`
-    **non-excess** (a normal sample reports 3.0, not 0.0).
+    **non-excess** (a normal sample reports 3.0, not 0.0). `effective_n` is the number of
+    independent observations the record was read at, or `None` when that is all `n` of them.
 
     `ser_json_inf_nan="constants"`: an infinity here would otherwise serialise to `null`
     and read back as a missing measurement rather than an extreme one.
@@ -224,6 +225,7 @@ class DSRResult(BaseModel):
     skew: float
     kurt: float
     n_trials: int
+    effective_n: int | None = None
 
 
 def _expected_max_sharpe(n_trials: int, variance: float) -> float:
@@ -253,6 +255,7 @@ def deflated_sharpe(
     n_trials: int,
     *,
     trial_sr_variance: float | None = None,
+    effective_n: int | None = None,
 ) -> DSRResult:
     """Deflated Sharpe ratio of `returns` against a search over `n_trials` configurations.
 
@@ -268,17 +271,31 @@ def deflated_sharpe(
     `1 / (T - 1)`, which is what to use when the per-trial Sharpes are not to hand. A
     negative, NaN or infinite `V` raises rather than propagating into `sr_star`.
 
+    `effective_n` is how many *independent* observations stand behind `returns` when that
+    is fewer than `len(returns)`: trades entered together on instruments that move together
+    are one observation's worth of evidence however many rows they fill. It replaces `n`
+    where `n` measures precision - the `sqrt(n - 1)` that turns a Sharpe into a z-score, and
+    the default `V` - so a record cloned k times is exactly as significant as the original.
+    The Sharpe and the moments are still those of the returns themselves. `None` counts
+    every observation; anything outside `1..len(returns)` raises.
+
     Fewer than three observations, or a zero standard deviation, leave the ratio undefined:
     the result then reports `sr = 0.0` and `prob = 0.0` - a track record that cannot be
     measured never passes the gate.
     """
     array = _as_array(returns)
     n = int(array.size)
-    if n < 3 or float(array.std(ddof=1)) <= 0.0:  # short-circuits before ddof=1 can divide by 0
-        return DSRResult(sr=0.0, sr_star=0.0, prob=0.0, n=n, skew=0.0, kurt=0.0, n_trials=n_trials)
+    if effective_n is not None and not 1 <= effective_n <= max(n, 1):
+        raise ValueError(f"effective_n must be between 1 and the {n} observations, got {effective_n!r}")
+    independent = n if effective_n is None else effective_n
+    # short-circuits before ddof=1 can divide by 0
+    if n < 3 or independent < 3 or float(array.std(ddof=1)) <= 0.0:
+        return DSRResult(
+            sr=0.0, sr_star=0.0, prob=0.0, n=n, skew=0.0, kurt=0.0, n_trials=n_trials, effective_n=effective_n
+        )
 
     sr = sharpe(array)
-    variance = 1.0 / (n - 1) if trial_sr_variance is None else float(trial_sr_variance)
+    variance = 1.0 / (independent - 1) if trial_sr_variance is None else float(trial_sr_variance)
     threshold = _expected_max_sharpe(n_trials, variance)
     g3 = skewness(array)
     g4 = excess_kurtosis(array) + 3.0
@@ -286,8 +303,11 @@ def deflated_sharpe(
     # Non-negative for any real distribution: the moment inequality g4 >= g3**2 + 1 makes
     # this quadratic in SR have a non-positive discriminant. Guarded anyway.
     spread = 1.0 - g3 * sr + ((g4 - 1.0) / 4.0) * sr * sr
-    prob = 0.0 if spread <= 0.0 else norm_cdf((sr - threshold) * math.sqrt(n - 1) / math.sqrt(spread))
-    return DSRResult(sr=sr, sr_star=threshold, prob=prob, n=n, skew=g3, kurt=g4, n_trials=n_trials)
+    precision = math.sqrt(independent - 1)
+    prob = 0.0 if spread <= 0.0 else norm_cdf((sr - threshold) * precision / math.sqrt(spread))
+    return DSRResult(
+        sr=sr, sr_star=threshold, prob=prob, n=n, skew=g3, kurt=g4, n_trials=n_trials, effective_n=effective_n
+    )
 
 
 # --- stationary bootstrap -----------------------------------------------------
@@ -580,6 +600,7 @@ def evaluate(
     stressed_r: Sequence[float] | np.ndarray | None = None,
     seed: int = 0,
     trial_sr_variance: float | None = None,
+    effective_n: int | None = None,
 ) -> GateResult:
     """Run the six gate rules of spec section 6 over one config's pooled OOS trades.
 
@@ -596,6 +617,11 @@ def evaluate(
     `bh_curve` is a buy-and-hold equity curve for the same instrument and window, and
     `years` its length in calendar years (shared by both MAR figures, so it must cover the
     same span).
+
+    `effective_n` is rule 2's independent-observation count (`deflated_sharpe`), for a series
+    whose trades are not independent draws; it reaches the stressed re-run too. Rule 1 still
+    counts trades and rules 3 and 4 still resample them - their block bootstrap keeps trades
+    that sit together in the series together, which is its own answer to the same problem.
 
     An empty `baseline_r` fails rule 4 rather than skipping it: with nothing to beat, the
     config has not been shown to beat anything - `baseline_n` records that it was empty, so
@@ -617,7 +643,7 @@ def evaluate(
     if n < min_trades:
         return GateResult(n=n, rule1=False)
 
-    dsr = deflated_sharpe(array, n_trials, trial_sr_variance=trial_sr_variance)
+    dsr = deflated_sharpe(array, n_trials, trial_sr_variance=trial_sr_variance, effective_n=effective_n)
 
     # One draw of the config's resamples, feeding rule 3's p5 and rule 4's left arm. The
     # generator is then handed on to the right arm, so both match the standalone helpers.
@@ -646,6 +672,7 @@ def evaluate(
             stressed_r=None,
             seed=seed,
             trial_sr_variance=trial_sr_variance,
+            effective_n=effective_n,
         )
         rule6 = stressed.rules_1_to_5_passed
 

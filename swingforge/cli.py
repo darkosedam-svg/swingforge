@@ -47,6 +47,7 @@ from swingforge.lab.tournament import (
     ENTRIES,
     EXITS,
     SESSIONS,
+    UNIVERSE_SYMBOL,
     exit_rule,
     instrument_key,
     months_between,
@@ -410,20 +411,35 @@ def _tournament(
         report_path = write_report(result, out_dir / f"{_filesystem_safe(run_id)}.md")
 
     pooled = [row for row in result.rows if row["split"] == "pooled"]
-    # I3: every passing config id, `IS_SELECTED` views included -- they are pooled rows
-    # like any other and are gated the same way, so no separate list is needed for them.
+    # I3: every passing config id, `IS_SELECTED` views and `venue:*` universe trials included
+    # -- they are pooled rows like any other and are gated the same way, so no separate list
+    # is needed for them (`_universe_hint` says what a passing universe id is for).
     passed = sorted((row for row in pooled if row["passed"] is True), key=lambda row: str(row["config_id"]))
     typer.echo(f"run id: {run_id}")
     typer.echo(f"report written to {report_path}")
     typer.echo(f"pooled rows: {len(pooled)}; passed: {len(passed)}")
+    typer.echo(f"universe trials: {len(result.universe)}")
     # Rule 2's deflation inputs, so a blanket "nothing passes" verdict can be audited: a
     # handful of tiny-n configs with huge per-trade Sharpes inflate V for the whole run.
     typer.echo(f"n_trials: {result.n_trials}; trial_sr_variance: {result.trial_sr_variance}")
     typer.echo("passing configs:")
     for row in passed:
         typer.echo(f"  {row['config_id']}")
+    hint = _universe_hint([str(row["config_id"]) for row in passed])
+    if hint is not None:
+        typer.echo(hint)
     for instrument, reason in result.excluded:
         typer.echo(f"excluded {instrument_key(instrument)}: {reason}")
+
+
+def _universe_hint(passed_ids: Sequence[str]) -> str | None:
+    """What to do with a passing `venue:*` config, or `None` when there is none."""
+    if not any(config_id.endswith(f":{UNIVERSE_SYMBOL}") for config_id in passed_ids):
+        return None
+    return (
+        f"a `venue:{UNIVERSE_SYMBOL}` config passed on its instruments traded together: enable it per "
+        "instrument (the report lists how many it pools; see deploy/README.md)"
+    )
 
 
 @app.command()
@@ -473,6 +489,11 @@ def _parse_config_id(config_id: str) -> tuple[str, str, str, str]:
     if len(parts) != 4 or ":" not in parts[3]:
         raise ValueError(f"invalid config id {config_id!r}; expected entry|exit|session|venue:symbol")
     entry, exit_name, session, inst_key = parts
+    if inst_key.endswith(f":{UNIVERSE_SYMBOL}"):
+        raise ValueError(
+            f"config id {config_id!r} pools every instrument of the venue; run one `paper` per instrument, "
+            f"e.g. {entry}|{exit_name}|{session}|{inst_key.removesuffix(UNIVERSE_SYMBOL)}<SYMBOL>"
+        )
     return entry, exit_name, session, inst_key
 
 

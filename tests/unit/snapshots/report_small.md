@@ -15,6 +15,12 @@ Written to be read. The complete record of this run is the `results` table — a
 | ict\|IS_SELECTED\|none\|hyperliquid:BTC | 4 | 0.300 | 0.375 | 0.420 | -0.040 | -0.110 | 1.400 | 0.750 | ✓ | ✗ | ✓ | ✗ | ✓ | – | ✗ |
 | baseline\|fixed_r_2\|none\|hyperliquid:BTC | 8 | -0.150 | -0.200 | 0.420 | -0.040 | -0.110 | 0.200 | 0.750 | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
+## Gate, pooled across instruments
+
+Each entry, exit and session graded once more on the out-of-sample trades of every instrument of the venue together (`venue:*`), against the pooled baseline and an equal-weight buy-and-hold of the same instruments. Instruments of one venue move together, so these trades are not independent draws: `entry days` counts the distinct days they were entered on, and it is the sample size rule 2 reads the row at: a smaller sample shrinks the z-score and, when no cross-trial variance could be measured, also raises the Sharpe it is measured against. Rule 1 counts trades, so a row can clear it on fewer than 60 entry days - read the two columns together. MAR is not comparable with the table above: a pooled row holds one stream of bets per instrument. A row that passes is a verdict on the instruments traded together, to be enabled on each instrument its `instruments` cell names - every instrument the config ran on, whether or not it traded out of sample, and all of them are in the benchmark. Rows that clear rule 1 rank first.
+
+_none_
+
 ## Top 3 configs, IS vs OOS
 
 Every `IS_SELECTED` row follows, whatever its rank: it is the walk-forward view.

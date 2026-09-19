@@ -137,6 +137,19 @@ def test_parse_config_id_rejects_malformed_ids(bad: str) -> None:
         cli._parse_config_id(bad)
 
 
+def test_parse_config_id_refuses_a_universe_id() -> None:
+    """`venue:*` is a verdict on several instruments traded together; `paper` runs one
+    instrument per process, so the id is refused with what to run instead."""
+    with pytest.raises(ValueError, match="one `paper` per instrument"):
+        cli._parse_config_id("ict|fixed_r_2|none|hyperliquid:*")
+
+
+def test_universe_hint_appears_only_when_a_universe_config_passed() -> None:
+    assert cli._universe_hint(["ict|fixed_r_2|none|hyperliquid:BTC"]) is None
+    hint = cli._universe_hint(["ict|fixed_r_2|none|hyperliquid:BTC", "ict|fixed_r_2|none|hyperliquid:*"])
+    assert hint is not None and "per instrument" in hint
+
+
 def test_find_instrument_matches_on_symbol() -> None:
     store = Store(":memory:")
     store.upsert_instruments([BTC])
@@ -737,6 +750,7 @@ def test_tournament_command_runs_and_writes_a_report(monkeypatch: pytest.MonkeyP
     )
     assert result.exit_code == 0, result.output
     assert "pooled rows:" in result.output
+    assert "universe trials: 0" in result.output  # one instrument: nothing to pool
 
     reports = list(out_dir.glob("*.md"))
     assert len(reports) == 1

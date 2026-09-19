@@ -237,6 +237,62 @@ def test_buy_and_hold_curve_of_no_closes_is_flat() -> None:
     assert tournament.buy_and_hold_curve([], [(base, base)]) == [1.0]
 
 
+def test_universe_buy_and_hold_curve_is_the_equal_weight_portfolio() -> None:
+    base = datetime(2021, 1, 1, tzinfo=UTC)
+    step = timedelta(hours=4)
+    window = [(base, base + 3 * step)]
+    curve = tournament.universe_buy_and_hold_curve(
+        {
+            "v:A": [(base, 100.0), (base + step, 110.0), (base + 2 * step, 121.0)],
+            "v:B": [(base, 100.0), (base + step, 90.0), (base + 2 * step, 99.0)],
+        },
+        {"v:A": window, "v:B": window},
+    )
+    # bar 1: mean(+10%, -10%) = 0; bar 2: mean(+10%, +10%) = +10%
+    assert curve == pytest.approx([1.0, 1.0, 1.1])
+
+
+def test_universe_buy_and_hold_curve_holds_only_the_members_in_a_window() -> None:
+    """Members' OOS windows differ (a later listing starts its walk-forward later), so at any
+    bar the benchmark holds whichever members are out of sample then - alone if need be."""
+    base = datetime(2021, 1, 1, tzinfo=UTC)
+    step = timedelta(hours=4)
+    curve = tournament.universe_buy_and_hold_curve(
+        {
+            "v:A": [(base + i * step, close) for i, close in enumerate([100.0, 110.0, 110.0, 110.0])],
+            "v:B": [(base + i * step, close) for i, close in enumerate([50.0, 100.0, 100.0, 120.0])],
+        },
+        {"v:A": [(base, base + 2 * step)], "v:B": [(base + 2 * step, base + 4 * step)]},
+    )
+    # A alone: +10%. B's doubling happened before its window opened and is never credited;
+    # inside its window B goes 100 -> 120.
+    assert curve == pytest.approx([1.0, 1.1, 1.1 * 1.2])
+
+
+def test_universe_buy_and_hold_curve_without_members_is_flat() -> None:
+    assert tournament.universe_buy_and_hold_curve({}, {}) == [1.0]
+
+
+def test_universe_buy_and_hold_curve_rejects_a_non_positive_close() -> None:
+    base = datetime(2021, 1, 1, tzinfo=UTC)
+    closes = {"v:A": [(base, 0.0), (base + timedelta(hours=4), 100.0)]}
+    with pytest.raises(ValueError, match="not positive"):
+        tournament.universe_buy_and_hold_curve(closes, {"v:A": [(base, base + timedelta(days=1))]})
+
+
+def test_union_years_counts_overlapping_windows_once() -> None:
+    base = datetime(2021, 1, 1, tzinfo=UTC)
+    year = timedelta(days=365.25)
+    windows = [
+        (base, base + year),
+        (base + year / 2, base + 3 * year / 2),  # overlaps the first by half a year
+        (base + 3 * year, base + 4 * year),  # disjoint
+        (base + year, base + year),  # empty
+    ]
+    assert tournament.union_years(windows) == pytest.approx(2.5)
+    assert tournament.union_years([]) == 0.0
+
+
 # --- end to end on a synthetic store ---------------------------------------------
 
 
@@ -486,8 +542,9 @@ def test_run_tournament_row_count_is_splits_plus_pooled_plus_is_selected(tournam
     assert all(row["excluded_reason"].startswith("error:LookupError") for row in errored)
 
     ok = len(seen) - len(errored)
-    is_selected = [row for row in result.rows if row["exit"] == "IS_SELECTED"]
-    assert len(result.rows) == ok * (splits + 1) + len(errored) + len(is_selected)
+    # every universe trial (enumerated or IS-selected) adds exactly one pooled row
+    is_selected = [row for row in result.rows if row["exit"] == "IS_SELECTED" and row["symbol"] != "*"]
+    assert len(result.rows) == (ok * (splits + 1) + len(errored) + len(is_selected) + len(result.universe))
 
 
 @pytest.mark.slow
@@ -532,8 +589,9 @@ def test_run_tournament_gates_every_config_that_ran(tournament_run) -> None:
 @pytest.mark.slow
 def test_run_tournament_counts_the_selection_views_as_trials(tournament_run) -> None:
     _, result, _, seen = tournament_run
-    views = {row["config_id"] for row in result.rows if row["exit"] == "IS_SELECTED"}
-    assert result.n_trials == len(seen) + len(views)
+    views = {row["config_id"] for row in result.rows if row["exit"] == "IS_SELECTED" and row["symbol"] != "*"}
+    # a universe trial is one more thing the search looked at, so it deflates too
+    assert result.n_trials == len(seen) + len(views) + len(result.universe)
     for row in result.rows:
         if row["split"] == "pooled" and row["config_id"] in result.gates:
             assert result.gates[row["config_id"]].dsr is None or (
@@ -547,12 +605,292 @@ def test_run_tournament_trial_variance_is_taken_over_the_selectable_trials(tourn
     sharpes = [
         gate.sharpe(tournament.realized_rs(trades))
         for config_id, trades in result.oos_trades.items()
-        if "|IS_SELECTED|" not in config_id and len(trades) >= tournament.V_MIN_TRADES
+        # per-instrument enumerated trials only: never a view, never a universe trial
+        if "|IS_SELECTED|" not in config_id
+        and config_id not in result.universe
+        and len(trades) >= tournament.V_MIN_TRADES
     ]
     if len(sharpes) >= 2:
         assert result.trial_sr_variance == pytest.approx(float(np.var(sharpes, ddof=1)))
     else:
         assert result.trial_sr_variance is None
+
+
+@pytest.mark.slow
+def test_run_tournament_grades_a_universe_trial_per_entry_exit_and_session(tournament_run) -> None:
+    """BTC and ETH both ran `ict` and `baseline`, so each (entry, exit, session) of those - and
+    each IS-selected view - is graded once more on the two instruments' OOS trades together."""
+    _, result, _, _ = tournament_run
+    members = ("hyperliquid:BTC", "hyperliquid:ETH")
+    for entry in ("ict", "baseline"):
+        for exit_name in (*TEST_EXITS, "IS_SELECTED"):
+            config_id = f"{entry}|{exit_name}|none|hyperliquid:*"
+            if exit_name == "IS_SELECTED" and config_id not in result.universe:
+                continue  # a view exists only where a split had enough IS trades to choose
+            assert result.universe[config_id] == members, config_id
+            merged = result.oos_trades[config_id]
+            parts = [result.oos_trades[f"{entry}|{exit_name}|none|{key}"] for key in members]
+            assert len(merged) == sum(len(part) for part in parts)
+            assert {trade.instrument.symbol for trade in merged} == {"BTC", "ETH"}
+            stamps = [trade.entry_fill.ts for trade in merged]
+            assert stamps == sorted(stamps)
+            (row,) = [r for r in result.rows if r["config_id"] == config_id]
+            assert (row["split"], row["venue"], row["symbol"]) == ("pooled", "hyperliquid", "*")
+            assert row["n_oos"] == len(merged) == result.gates[config_id].n
+    assert f"ict|{TEST_EXITS[0]}|none|hyperliquid:*" in result.universe
+
+
+@pytest.mark.slow
+def test_run_tournament_needs_two_members_for_a_universe_trial(tournament_run) -> None:
+    """`zones` errored on ETH, so only BTC ran it: a pool of one instrument is that
+    instrument's own trial, and grading it twice would only add a duplicate to the search."""
+    _, result, _, _ = tournament_run
+    assert not any(config_id.startswith("zones|") for config_id in result.universe)
+    assert not any(row["entry"] == "zones" and row["symbol"] == "*" for row in result.rows)
+
+
+@pytest.mark.slow
+def test_run_tournament_grades_a_universe_trial_at_its_entry_day_count(tournament_run) -> None:
+    """Rule 2 reads a universe trial at the number of distinct days its trades were entered on;
+    an instrument's own trial is read at face value, as it always was."""
+    _, result, _, _ = tournament_run
+    for config_id, gate_result in result.gates.items():
+        if gate_result.dsr is None:
+            continue
+        if config_id in result.universe:
+            assert gate_result.dsr.effective_n == tournament.entry_days(result.oos_trades[config_id])
+        else:
+            assert gate_result.dsr.effective_n is None
+
+
+def test_entry_days_counts_distinct_utc_dates() -> None:
+    t0 = datetime(2024, 1, 1, 20, tzinfo=UTC)
+    trades = [_trade(t0 + timedelta(hours=4 * i), 1.0) for i in range(3)]  # 20:00, 00:00, 04:00
+    assert tournament.entry_days(trades) == 2
+    assert tournament.entry_days([]) == 0
+
+
+def test_a_universe_row_hands_the_gate_its_entry_day_count() -> None:
+    splits, closes = _oos_fixture()
+    rng = np.random.default_rng(1)
+    # 90 trades, six a day: 15 entry days
+    oos = _series(list(rng.normal(0.35, 1.0, 90)), splits[0].oos_start)
+    gates: dict[str, object] = {}
+    tournament._graded_row(
+        run_id="r",
+        ts=_TS,
+        config_id="u",
+        identity={
+            "entry": "ict",
+            "exit": "fixed_r_2",
+            "session": "none",
+            "venue": "hyperliquid",
+            "symbol": "*",
+        },
+        is_trades=[],
+        oos=oos,
+        baseline=oos,
+        benchmark=lambda: (
+            tournament.buy_and_hold_curve(closes, [(s.oos_start, s.oos_end) for s in splits]),
+            1.0,
+        ),
+        resolution_mode="subbars",
+        n_trials=12,
+        seed=0,
+        trial_sr_variance=0.05,
+        gates=gates,  # type: ignore[arg-type]
+        effective_n=tournament.entry_days(oos),
+    )
+    assert gates["u"].dsr.effective_n == 15  # type: ignore[attr-defined]
+    assert gates["u"].n == 90  # type: ignore[attr-defined]
+
+
+def test_universe_trials_merge_the_members_chronologically() -> None:
+    t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    btc = [_trade(t0 + timedelta(hours=8 * i), 1.0) for i in range(3)]
+    eth = [
+        _trade(t0 + timedelta(hours=8 * i + 4), -1.0).model_copy(update={"instrument": ETH}) for i in range(3)
+    ]
+    trials = tournament._universe_trials(
+        [BTC, ETH],
+        {"ict|fixed_r_2|none|hyperliquid:BTC": btc, "ict|fixed_r_2|none|hyperliquid:ETH": eth},
+        {"ict|fixed_r_2|none|hyperliquid:BTC": btc[:1], "ict|fixed_r_2|none|hyperliquid:ETH": eth[:1]},
+        entries=("ict",),
+        exits=("fixed_r_2",),
+        sessions=("none",),
+    )
+    (trial,) = trials.values()
+    assert trial.id == "ict|fixed_r_2|none|hyperliquid:*"
+    assert trial.members == ("hyperliquid:BTC", "hyperliquid:ETH")
+    assert [t.realized_r for t in trial.oos_trades] == [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+    assert [t.instrument.symbol for t in trial.is_trades] == ["BTC", "ETH"]
+
+
+def test_universe_trials_order_simultaneous_entries_by_instrument() -> None:
+    """Two instruments entering on the same bar is the common case on correlated perps; the
+    order has to be fixed by something other than dict iteration for the run to be reproducible."""
+    t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    btc = [_trade(t0, 1.0)]
+    eth = [_trade(t0, -1.0).model_copy(update={"instrument": ETH})]
+    for order in ([ETH, BTC], [BTC, ETH]):
+        trials = tournament._universe_trials(
+            order,
+            {"ict|fixed_r_2|none|hyperliquid:ETH": eth, "ict|fixed_r_2|none|hyperliquid:BTC": btc},
+            {},
+            entries=("ict",),
+            exits=("fixed_r_2",),
+            sessions=("none",),
+        )
+        (trial,) = trials.values()
+        assert [t.instrument.symbol for t in trial.oos_trades] == ["BTC", "ETH"]
+
+
+def test_universe_trials_skip_a_pool_of_one_and_never_cross_venues() -> None:
+    t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    eur = BTC.model_copy(update={"venue": "oanda", "symbol": "EUR_USD"})
+    trials = tournament._universe_trials(
+        [BTC, ETH, eur],
+        {
+            "ict|fixed_r_2|none|hyperliquid:BTC": [_trade(t0, 1.0)],
+            # ETH errored: its config id never reached `pooled`, so it is not a member
+            "ict|fixed_r_2|none|oanda:EUR_USD": [_trade(t0, 1.0).model_copy(update={"instrument": eur})],
+        },
+        {},
+        entries=("ict",),
+        exits=("fixed_r_2",),
+        sessions=("none",),
+    )
+    assert trials == {}
+
+
+def test_a_member_without_oos_trades_does_not_make_a_pool() -> None:
+    """ETH ran the config and never traded out of sample: pooled with BTC, the series is BTC's
+    own trial under a second name, so no universe trial is formed. With SOL trading as well
+    there is a real pool - and ETH is still a member of it, because the entry was live on it."""
+    t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    btc = [_trade(t0, 1.0)]
+    sol = [_trade(t0 + timedelta(hours=4), -1.0).model_copy(update={"instrument": SOL})]
+    pooled = {"ict|fixed_r_2|none|hyperliquid:BTC": btc, "ict|fixed_r_2|none|hyperliquid:ETH": ()}
+    kwargs = {"entries": ("ict",), "exits": ("fixed_r_2",), "sessions": ("none",)}
+    assert tournament._universe_trials([BTC, ETH, SOL], pooled, {}, **kwargs) == {}
+
+    pooled["ict|fixed_r_2|none|hyperliquid:SOL"] = sol
+    (trial,) = tournament._universe_trials([BTC, ETH, SOL], pooled, {}, **kwargs).values()
+    assert trial.members == ("hyperliquid:BTC", "hyperliquid:ETH", "hyperliquid:SOL")
+    assert [t.instrument.symbol for t in trial.oos_trades] == ["BTC", "SOL"]
+
+
+def test_run_tournament_refuses_an_instrument_named_like_the_universe() -> None:
+    """Its config ids would be the universe trials' ids, and one would overwrite the other."""
+    store = Store(":memory:")
+    try:
+        with pytest.raises(ValueError, match="universe"):
+            tournament.run_tournament(
+                store,
+                [BTC, BTC.model_copy(update={"symbol": "*"})],
+                entry_factory=_factory(),
+                session_factory=session_factory,
+            )
+    finally:
+        store.close()
+
+
+def _universe_context(
+    pooled: dict[str, Sequence[Trade]], keys: Sequence[str]
+) -> tuple[tournament._GateContext, dict[str, list[tuple[datetime, float]]]]:
+    splits, closes = _oos_fixture()
+    falling = [(ts, 200.0 - 0.1 * index) for index, (ts, _) in enumerate(closes)]
+    series = {key: (closes if index % 2 == 0 else falling) for index, key in enumerate(keys)}
+    context = tournament._GateContext(
+        run_id="r",
+        ts=_TS,
+        splits=dict.fromkeys(keys, splits),
+        closes={key: tuple(value) for key, value in series.items()},
+        pooled=pooled,
+        n_trials=12,
+        seed=0,
+        trial_sr_variance=None,
+        gates={},
+    )
+    return context, series
+
+
+def test_a_universe_row_is_graded_against_its_own_members() -> None:
+    """Rule 4's baseline is the `baseline` entry on the same members - SOL ran `baseline` but its
+    `ict` config errored, so its baseline trades stay out - rule 5's benchmark is the members'
+    equal-weight curve over the union of their windows, and rule 2 reads the entry days."""
+    splits, _ = _oos_fixture()
+    first = splits[0].oos_start
+    rng = np.random.default_rng(2)
+
+    def series(n: int, symbol_of: Instrument, mean: float, offset_hours: int) -> list[Trade]:
+        return [
+            trade.model_copy(update={"instrument": symbol_of})
+            for trade in _series(list(rng.normal(mean, 1.0, n)), first + timedelta(hours=offset_hours))
+        ]
+
+    pooled: dict[str, Sequence[Trade]] = {
+        "ict|fixed_r_2|none|hyperliquid:BTC": series(40, BTC, 0.4, 0),
+        "ict|fixed_r_2|none|hyperliquid:ETH": series(40, ETH, 0.4, 2),
+        "baseline|fixed_r_2|none|hyperliquid:BTC": series(30, BTC, 0.0, 0),
+        "baseline|fixed_r_2|none|hyperliquid:ETH": series(25, ETH, 0.0, 2),
+        "baseline|fixed_r_2|none|hyperliquid:SOL": series(50, SOL, 0.0, 1),
+    }
+    universe = tournament._universe_trials(
+        [BTC, ETH, SOL], pooled, {}, entries=("ict",), exits=("fixed_r_2",), sessions=("none",)
+    )
+    (trial,) = universe.values()
+    assert trial.members == ("hyperliquid:BTC", "hyperliquid:ETH")
+
+    context, closes = _universe_context(pooled, ["hyperliquid:BTC", "hyperliquid:ETH", "hyperliquid:SOL"])
+    (row,) = tournament._universe_rows(
+        universe, {"hyperliquid:BTC": "subbars", "hyperliquid:ETH": "pessimistic"}, context
+    )
+    result = context.gates[trial.id]
+    assert (row["symbol"], row["n_oos"], row["resolution_mode"]) == ("*", 80, "mixed")
+    assert result.baseline_n == 30 + 25
+    windows = {key: [(s.oos_start, s.oos_end) for s in splits] for key in trial.members}
+    expected = gate.mar(
+        tournament.universe_buy_and_hold_curve({key: closes[key] for key in trial.members}, windows),
+        tournament.union_years(window for key in trial.members for window in windows[key]),
+    )
+    assert result.mar_bh == pytest.approx(expected)
+    assert result.dsr is not None
+    assert result.dsr.effective_n == tournament.entry_days(trial.oos_trades) < 80
+
+
+def test_a_universe_row_reports_no_fill_mode_when_a_members_is_unknown() -> None:
+    splits, _ = _oos_fixture()
+    trades = _series([1.0, -1.0], splits[0].oos_start)
+    pooled: dict[str, Sequence[Trade]] = {
+        "ict|fixed_r_2|none|hyperliquid:BTC": trades,
+        "ict|fixed_r_2|none|hyperliquid:ETH": [t.model_copy(update={"instrument": ETH}) for t in trades],
+    }
+    universe = tournament._universe_trials(
+        [BTC, ETH], pooled, {}, entries=("ict",), exits=("fixed_r_2",), sessions=("none",)
+    )
+    context, _ = _universe_context(pooled, ["hyperliquid:BTC", "hyperliquid:ETH"])
+    (agree,) = tournament._universe_rows(
+        universe, {"hyperliquid:BTC": "subbars", "hyperliquid:ETH": "subbars"}, context
+    )
+    (unknown,) = tournament._universe_rows(universe, {"hyperliquid:BTC": "subbars"}, context)
+    assert agree["resolution_mode"] == "subbars"
+    assert unknown["resolution_mode"] is None
+
+
+def test_enumerated_trials_leave_the_selection_views_out_of_v() -> None:
+    """V has always been taken over the enumerated trials only - the views are chosen from
+    them. (`run_tournament` leaves the universe trials out as well; see `V_MIN_TRADES`.)"""
+    pooled = {
+        "ict|fixed_r_2|none|hyperliquid:BTC": (),
+        "ict|IS_SELECTED|none|hyperliquid:BTC": (),
+        "ict|fixed_r_2|none|hyperliquid:*": (),
+        "ict|IS_SELECTED|none|hyperliquid:*": (),
+    }
+    assert list(tournament._enumerated(pooled)) == [
+        "ict|fixed_r_2|none|hyperliquid:BTC",
+        "ict|fixed_r_2|none|hyperliquid:*",
+    ]
 
 
 def test_trial_variance_ignores_trials_below_the_rule_1_floor() -> None:

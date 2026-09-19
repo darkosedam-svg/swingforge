@@ -34,6 +34,10 @@ LOSER = "baseline|fixed_r_2|none|hyperliquid:BTC"
 BROKEN = "zones|fixed_r_2|none|hyperliquid:BTC"
 RUINED = "zones|trail_1_2|none|hyperliquid:BTC"
 SELECTED = "ict|IS_SELECTED|none|hyperliquid:BTC"
+UNIVERSE = "ict|fixed_r_2|none|hyperliquid:*"
+UNIVERSE_THIN = "zones|fixed_r_2|none|hyperliquid:*"
+UNIVERSE_VIEW = "ict|IS_SELECTED|none|hyperliquid:*"
+UNIVERSE_HEADING = "## Gate, pooled across instruments"
 
 
 def _trade(index: int, realized_r: float, regime: str, *, spread: float = 0.5) -> Trade:
@@ -279,6 +283,7 @@ def test_render_is_deterministic() -> None:
     [
         "# swingforge tournament small",
         "## Gate",
+        UNIVERSE_HEADING,
         "## Top 20 configs, IS vs OOS",
         "## IS-selected exit per split",
         "## Regime breakdown",
@@ -296,6 +301,7 @@ def test_sections_appear_in_the_documented_order() -> None:
     text = report.render(_result())
     order = [
         "## Gate",
+        UNIVERSE_HEADING,
         "## Top 20 configs",
         "## IS-selected exit per split",
         "## Regime breakdown",
@@ -435,6 +441,143 @@ def test_regime_breakdown_falls_back_to_every_config() -> None:
     assert any("No config passed the gate" in line for line in section)
 
 
+# --- universe trials: their own section, never the per-instrument tables ----------
+
+
+def _result_with_universe() -> TournamentResult:
+    """`_result()` plus three universe rows over BTC and SOL: one that clears rule 1, a thin one
+    with a flattering expectancy, and an IS-selected view."""
+    result = _result()
+    sol_trades = tuple(
+        # entered on the same bars as BTC's trades 0..3: four new trades, no new entry days
+        _trade(i, -0.5, "range_midvol").model_copy(update={"id": f"s{i}", "instrument": SOL})
+        for i in range(4)
+    )
+    merged = tuple(sorted((*result.oos_trades[WINNER], *sol_trades), key=lambda t: (t.entry_fill.ts, t.id)))
+    gate_columns = {
+        "dsr_prob": 0.42,
+        "boot_p5": -0.04,
+        "diff_p5": -0.11,
+        "mar": 0.2,
+        "mar_bh": 0.75,
+        "g1": True,
+        "g2": False,
+        "g3": True,
+        "g4": False,
+        "g5": True,
+        "g6": False,
+        "passed": False,
+    }
+    rows = (
+        *result.rows,
+        _row(UNIVERSE, "pooled", n_is=38, n_oos=12, exp_is=0.2, exp_oos=0.1, **gate_columns),
+        _row(UNIVERSE_THIN, "pooled", n_is=9, n_oos=3, exp_is=0.1, exp_oos=9.0, g1=False, passed=False),
+        _row(UNIVERSE_VIEW, "pooled", n_is=30, n_oos=8, exp_is=0.3, exp_oos=0.05, **gate_columns),
+    )
+    members = ("hyperliquid:BTC", "hyperliquid:SOL")
+    return replace(
+        result,
+        rows=rows,
+        gates={
+            **result.gates,
+            UNIVERSE: _gate(passed=False, mar=0.2),
+            UNIVERSE_THIN: GateResult(n=3, rule1=False),
+            UNIVERSE_VIEW: _gate(passed=False, mar=0.2),
+        },
+        oos_trades={
+            **result.oos_trades,
+            UNIVERSE: merged,
+            UNIVERSE_THIN: sol_trades[:3],
+            UNIVERSE_VIEW: merged[:8],
+        },
+        universe={UNIVERSE: members, UNIVERSE_THIN: members, UNIVERSE_VIEW: members},
+    )
+
+
+def test_universe_rows_get_their_own_gate_table() -> None:
+    text = report.render(_result_with_universe())
+    table = [line for line in _section(text, UNIVERSE_HEADING) if line.startswith("|")]
+    assert table[0].startswith("| config | instruments | entry days | n_oos |")
+    body = _table_body(text, UNIVERSE_HEADING)
+    assert len(body) == 3
+    # the three-trade pool has by far the best expectancy and still reads last: it never cleared rule 1
+    assert body[-1].startswith(f"| {_escaped(UNIVERSE_THIN)} |")
+    line = next(line for line in body if line.startswith(f"| {_escaped(UNIVERSE)} |"))
+    # two members; twelve trades entered on the two days BTC's eight already covered
+    # the members are named: they are what a pass would be enabled on
+    assert line.startswith(f"| {_escaped(UNIVERSE)} | 2 (BTC, SOL) | 2 | 12 |")
+    header, separator = table[0], table[1]
+    assert line.count("|") - line.count(r"\|") == header.count("|") == separator.count("|")
+
+
+def test_the_universe_table_ranks_the_rows_that_clear_rule_1_first() -> None:
+    """A three-trade pool with a 9R expectancy is noise; the row a reader needs is the one the
+    gate could actually grade, so that is what survives a tight cutoff - beside every view."""
+    text = report.render(_result_with_universe(), top_n=1)
+    body = _table_body(text, UNIVERSE_HEADING)
+    assert [line.split(" | ")[0] for line in body] == [
+        f"| {_escaped(UNIVERSE)}",
+        f"| {_escaped(UNIVERSE_VIEW)}",
+    ]
+    assert any("1 row omitted" in line for line in _section(text, UNIVERSE_HEADING))
+
+
+def test_universe_rows_stay_out_of_the_per_instrument_gate_and_ranking() -> None:
+    with_universe = report.render(_result_with_universe(), top_n=1)
+    plain = report.render(_result(), top_n=1)
+    for heading in ("## Gate", "## Top 1 configs, IS vs OOS"):
+        assert _section(with_universe, heading) == _section(plain, heading), heading
+
+
+def test_the_universe_rows_shown_get_their_excursion_and_cost_stress_too() -> None:
+    """Rule 6 was graded on a universe row like any other, and it is the row a reader would act
+    on: its stress delta belongs in the report beside the instruments'."""
+    text = report.render(_result_with_universe(), top_n=1)
+    for heading in ("## Excursion", "## Cost stress"):
+        body = _table_body(text, heading)
+        configs = {line.split(" | ")[0] for line in body}
+        assert {f"| {_escaped(UNIVERSE)}", f"| {_escaped(UNIVERSE_VIEW)}"} <= configs, heading
+        assert f"| {_escaped(UNIVERSE_THIN)}" not in configs, heading
+        assert len(body) == 3 + 2, (
+            heading
+        )  # the three instrument rows and the two universe rows shown, in config-id order
+        assert any("3 rows omitted" in line for line in _section(text, heading)), heading
+
+
+def _regime_total(text: str) -> int:
+    return sum(int(line.split(" | ")[1]) for line in _table_body(text, "## Regime breakdown"))
+
+
+def test_the_regime_fallback_counts_a_universe_trade_once() -> None:
+    """With nothing passing, the breakdown pools every config that ran - and a universe trial's
+    trades are its members' trades, already counted under the same entry, exit and session."""
+    result = _result_with_universe()
+    failing = {key: gate.model_copy(update={"rule2": False}) for key, gate in result.gates.items()}
+    # winner 8 + loser 8 + view 4, then what only the universe rows hold: SOL's 4 under the
+    # winner's config, 3 under `zones`, and 4 under the view. Counted naively it would be 43.
+    assert _regime_total(report.render(replace(result, gates=failing))) == 8 + 8 + 4 + 4 + 3 + 4
+
+
+def test_a_passing_universe_row_does_not_recount_a_passing_members_trades() -> None:
+    result = _result_with_universe()
+    gates = {**result.gates, UNIVERSE: _gate(passed=True, mar=1.0)}
+    text = report.render(replace(result, gates=gates))
+    assert "Pooled over the configs that passed the gate." in _section(text, "## Regime breakdown")
+    assert _regime_total(text) == 8 + 4  # BTC's eight once, SOL's four once - not 8 + 12
+
+
+def test_a_universe_row_that_could_not_be_graded_is_listed_as_excluded() -> None:
+    result = _result_with_universe()
+    rows = tuple(
+        {**row, "excluded_reason": "error:ValueError: close 0.0 is not positive", "passed": None}
+        if row["config_id"] == UNIVERSE
+        else row
+        for row in result.rows
+    )
+    text = report.render(replace(result, rows=rows))
+    assert any(_escaped(UNIVERSE) in line for line in _table_body(text, "## Excluded"))
+
+
 def test_raw_signal_rows_are_appended_to_the_excursion_table() -> None:
     summary = ExcursionSummary(
         n=42,
@@ -460,7 +603,7 @@ def test_empty_result_still_renders_every_section() -> None:
     )
     text = report.render(empty)
     assert "## Gate" in text
-    assert text.count("_none_") >= 6
+    assert text.count("_none_") >= 7
     assert "rows omitted" not in text  # nothing to hide, so no note
 
 

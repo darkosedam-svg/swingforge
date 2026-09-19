@@ -261,6 +261,49 @@ def test_the_reference_sharpe_reproduces_the_formula_end_to_end() -> None:
     assert result.prob == pytest.approx(expected_prob(returns, result.sr_star), rel=1e-12)
 
 
+def test_cloning_a_record_buys_no_significance_at_its_effective_size() -> None:
+    """Five instruments that move as one hand the gate the same 40 trades five times over. Read
+    as 200 independent trades that is a far more significant Sharpe; read at its effective size
+    of 40 it is exactly as significant as the 40 were."""
+    once = planted(0.35, n=40)
+    cloned = np.repeat(once, 5)
+    honest = deflated_sharpe(once, n_trials=100, trial_sr_variance=0.01)
+    naive = deflated_sharpe(cloned, n_trials=100, trial_sr_variance=0.01)
+    adjusted = deflated_sharpe(cloned, n_trials=100, trial_sr_variance=0.01, effective_n=40)
+    assert naive.prob > honest.prob
+    assert (adjusted.n, adjusted.effective_n) == (200, 40)
+    # the population moments of a cloned sample are its own; only the Sharpe's ddof differs
+    assert adjusted.prob == pytest.approx(honest.prob, abs=0.03)
+    assert adjusted.prob < naive.prob
+
+
+def test_the_effective_size_also_sets_the_default_trial_variance() -> None:
+    returns = planted(0.3)
+    result = deflated_sharpe(returns, n_trials=2016, effective_n=50)
+    assert result.sr_star == pytest.approx(expected_sr_star(2016, 1.0 / 49.0), abs=1e-12)
+
+
+def test_without_an_effective_size_every_observation_counts() -> None:
+    returns = planted(0.3)
+    assert deflated_sharpe(returns, n_trials=2016, effective_n=None) == deflated_sharpe(
+        returns, n_trials=2016
+    )
+    assert deflated_sharpe(returns, n_trials=2016).effective_n is None
+    full = deflated_sharpe(returns, n_trials=2016, effective_n=len(returns))
+    assert full.prob == deflated_sharpe(returns, n_trials=2016).prob
+
+
+@pytest.mark.parametrize("bad", [0, -3, 201])
+def test_an_effective_size_outside_the_sample_is_rejected(bad: int) -> None:
+    with pytest.raises(ValueError, match="effective_n"):
+        deflated_sharpe(planted(0.3), n_trials=10, effective_n=bad)
+
+
+def test_an_effective_size_too_small_to_measure_gets_zero_probability() -> None:
+    result = deflated_sharpe(planted(0.5), n_trials=10, effective_n=2)
+    assert result.prob == 0.0
+
+
 def test_dsr_reports_the_moments_that_enter_the_formula() -> None:
     returns = planted(0.3)
     centred = returns - returns.mean()
@@ -590,6 +633,20 @@ def test_evaluate_passes_the_trial_variance_through_to_the_deflated_sharpe() -> 
     assert result.dsr is not None
     assert result.dsr.sr_star == pytest.approx(expected_sr_star(2016, 1.0), abs=1e-12)
     assert result.rule2 is False  # a variance that large deflates any 200-trade record away
+
+
+def test_evaluate_applies_the_effective_size_to_rule_2_and_to_the_stressed_rerun() -> None:
+    returns = planted(0.5, n=200)
+    plain = evaluate(returns, zero_mean(), FLAT_BH, years=1.0, stressed_r=returns)
+    clustered = evaluate(returns, zero_mean(), FLAT_BH, years=1.0, stressed_r=returns, effective_n=60)
+    assert plain.dsr is not None and clustered.dsr is not None
+    assert clustered.dsr.effective_n == 60
+    assert clustered.dsr.prob < plain.dsr.prob
+    assert clustered.stressed is not None and clustered.stressed.dsr is not None
+    assert clustered.stressed.dsr.effective_n == 60
+    # rule 1 still counts trades, and the bootstraps still resample them
+    assert clustered.n == 200 and clustered.rule1 is True
+    assert clustered.boot_p5 == plain.boot_p5
 
 
 # --- input validation ---------------------------------------------------------

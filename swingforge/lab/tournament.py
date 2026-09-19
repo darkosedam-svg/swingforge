@@ -26,6 +26,22 @@ and evaluates every gate (pass 2). V is taken over the trials holding at least
 of trades is unbounded noise that would otherwise set V for the whole run (see
 `V_MIN_TRADES`).
 
+**Universe trials.** One instrument rarely yields rule 1's 60 out-of-sample trades, so each
+`(entry, exit, session)` - and each IS-selected view - is graded once more on the OOS trades
+of every instrument of a venue together, under `entry|exit|session|venue:*`
+(`UNIVERSE_SYMBOL`). Nothing is replayed for it: the members' trades are merged by entry
+time, the rule-4 baseline is the `baseline` entry's trades on the same members, and rule 5's
+benchmark is the equal-weight buy-and-hold of the members (`universe_buy_and_hold_curve`).
+Every universe trial counts towards `n_trials` and none enters V (`V_MIN_TRADES`). ⚠ Its
+trades are *not* independent draws:
+instruments of one venue move together, so 60 pooled trades carry less information than 60
+trades of one instrument. Ordering by entry time keeps simultaneous trades adjacent, which
+lets the stationary bootstrap (rules 3 and 4) resample them as the clusters they are, and
+the deflated Sharpe (rule 2) reads a universe trial at its `entry_days` - the distinct days
+its trades were entered on - rather than its trade count, so the same move caught on five
+instruments is one observation's worth of significance. Rule 1 still counts trades, so a
+universe trial can clear it on fewer entry days than 60; the report prints both numbers.
+
 **What pass 1 keeps.** Only what pass 2 reads: per config a `_Replayed` (trades, 4H bar
 count, resolution mode), and per *instrument* one close series, which every config of that
 instrument shares. Keeping a whole `ConfigRun` per config instead — each with its own copy
@@ -45,9 +61,10 @@ import calendar
 import logging
 import math
 import zlib
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any, Literal, Protocol
 
 import numpy as np
@@ -76,6 +93,7 @@ __all__ = [
     "EXIT_RULES",
     "MAX_CONSECUTIVE_ERRORS",
     "SESSIONS",
+    "UNIVERSE_SYMBOL",
     "WARMUP_DAILY_BARS",
     "Config",
     "ConfigRun",
@@ -87,6 +105,7 @@ __all__ = [
     "add_months",
     "buy_and_hold_curve",
     "configs",
+    "entry_days",
     "exit_rule",
     "expectancy",
     "instrument_key",
@@ -98,6 +117,8 @@ __all__ = [
     "split_trades",
     "stressed_r",
     "trial_variance",
+    "union_years",
+    "universe_buy_and_hold_curve",
     "walk_forward_splits",
     "warmup_start",
 ]
@@ -113,6 +134,17 @@ EXIT_RULES: Mapping[str, ExitRule] = {rule.name: rule for rule in EXIT_GRID}
 
 EXITS: tuple[str, ...] = tuple(EXIT_RULES)
 """Exit-rule names in `EXIT_GRID` order — the tie-break order for IS selection."""
+
+UNIVERSE_SYMBOL = "*"
+"""The symbol a universe trial is reported under: `entry|exit|session|venue:*`.
+
+Not a symbol any venue lists, so a universe row can never be mistaken for an instrument's
+own - and `swingforge paper` refuses it, because a universe verdict is a claim about the
+members traded together, to be enabled instrument by instrument.
+"""
+
+_IS_SELECTED = "IS_SELECTED"
+"""The `exit` a selection view is reported under, in a config id and in the `exit` column."""
 
 WARMUP_DAILY_BARS = 60
 """Daily bars replayed before `start` so ATR(14)/ADX(14) and the regime tagger are seeded.
@@ -564,6 +596,71 @@ def buy_and_hold_curve(
     return curve
 
 
+def universe_buy_and_hold_curve(
+    closes: Mapping[str, Sequence[tuple[datetime, float]]],
+    windows: Mapping[str, Sequence[tuple[datetime, datetime]]],
+) -> list[float]:
+    """Equal-weight buy-and-hold of several instruments, each held only in its own OOS windows.
+
+    Rule 5's benchmark for a universe trial. `closes` and `windows` are keyed by instrument
+    key. At every bar the portfolio earns the mean bar-to-bar return of the members that are
+    inside one of their windows at that bar - rebalanced to equal weight each bar, and held
+    alone by whichever member is out of sample when the others are not (a later listing
+    starts its walk-forward later). As in `buy_and_hold_curve`, a member's move across the
+    gap between two of its windows is neither credited nor charged, and the curve starts at
+    1.0 so `gate.mar` can always read it.
+    """
+    returns: dict[datetime, list[float]] = {}
+    for key, series in closes.items():
+        for window_start, window_end in windows.get(key, ()):
+            segment = [(ts, close) for ts, close in series if window_start <= ts < window_end]
+            for (_, previous), (ts, current) in zip(segment, segment[1:], strict=False):
+                if previous <= 0.0:
+                    raise ValueError(f"close {previous} is not positive; a buy-and-hold curve needs prices")
+                returns.setdefault(ts, []).append(current / previous - 1.0)
+    curve = [1.0]
+    level = 1.0
+    for ts in sorted(returns):
+        level *= 1.0 + sum(returns[ts]) / len(returns[ts])
+        curve.append(level)
+    return curve
+
+
+def entry_days(trades: Sequence[Trade]) -> int:
+    """Distinct UTC days the closed trades of `trades` were entered on.
+
+    A universe trial's independent-observation count for rule 2 (`gate.deflated_sharpe`'s
+    `effective_n`), and what the report prints beside its `n_oos`. Entries on one day on
+    instruments of one venue count as a single observation. That removes *simultaneity* and
+    nothing else: two trades entered days apart on instruments that move together, and held
+    over the same stretch, still count as two, and so do entries either side of midnight UTC.
+    It is therefore an upper bound on the independent sample, not a conservative estimate of
+    it - the 2026-09-19 review measured it 15% above the true effective size for five
+    instruments correlated at 0.8 that never enter on the same bar, 61% above when half
+    their entries coincide, and exact for identical ones.
+    """
+    return len({trade.entry_fill.ts.date() for trade in trades if trade.realized_r is not None})
+
+
+def union_years(windows: Iterable[tuple[datetime, datetime]]) -> float:
+    """Calendar years covered by `windows`, overlaps counted once - a universe trial's `years`.
+
+    Its members' OOS windows mostly coincide, and the span the pooled trades and the
+    equal-weight benchmark share is the time at least one member was out of sample, not the
+    sum over members (which would divide five instruments' growth by five times the years).
+    """
+    seconds = 0.0
+    covered_to: datetime | None = None
+    for window_start, window_end in sorted(window for window in windows if window[1] > window[0]):
+        if covered_to is None or window_start > covered_to:
+            seconds += (window_end - window_start).total_seconds()
+            covered_to = window_end
+        elif window_end > covered_to:
+            seconds += (window_end - covered_to).total_seconds()
+            covered_to = window_end
+    return seconds / _SECONDS_PER_YEAR
+
+
 # --- the tournament ----------------------------------------------------------------
 
 
@@ -575,6 +672,8 @@ class TournamentResult:
     are keyed by config id, including the derived `IS_SELECTED` ids. `selection` maps an
     `IS_SELECTED` config id to `{split label: chosen exit}`. `n_trials` and
     `trial_sr_variance` are the two run-wide figures every gate was evaluated against.
+    `universe` maps each universe trial's id (`...|venue:*`, also a key of `gates` and
+    `oos_trades`) to the instrument keys whose trades it pools.
 
     `runs` is empty unless the run asked for `keep_runs=True`: nothing downstream needs it
     (the report reads `rows`, `gates` and `oos_trades`) and holding 2,016 of them is what
@@ -591,6 +690,7 @@ class TournamentResult:
     oos_trades: dict[str, tuple[Trade, ...]] = field(default_factory=dict)
     n_trials: int = 0
     trial_sr_variance: float | None = None
+    universe: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _finite_or_none(value: float | None) -> float | None:
@@ -691,6 +791,15 @@ under rule 1 says anything about how far the search could have pushed a *selecta
 so shorter trials are left out of V. `n_trials` still counts every trial, so the deflation
 stays conservative on N; with fewer than two qualifying trials V is `None` and the gate falls
 back to its analytical `1/(T-1)`.
+
+Universe trials are left out of V as well, for the opposite reason: they are the first trials
+to *reach* the floor, so on a venue where no instrument does they would set V alone - a few
+dozen trials sharing their entries and differing only in the exit, whose Sharpes sit close
+together and are measured at the full pooled length the gate is told not to trust. The
+2026-09-19 preview measured V = 0.0124 that way against an analytical `1/(55-1)` = 0.0185 at
+the rows' own entry-day count: rule 2 would have been a fifth easier on exactly the rows
+pooling exists to grade. With V left per-instrument a universe trial falls back to
+`1/(effective_n - 1)` whenever no instrument reaches the floor.
 """
 
 
@@ -699,6 +808,12 @@ def trial_variance(pooled: Iterable[Sequence[Trade]], *, min_trades: int = V_MIN
     across every trial holding at least `min_trades` pooled OOS trades; `None` below two."""
     sharpes = [gate.sharpe(realized_rs(trades)) for trades in pooled if len(trades) >= min_trades]
     return float(np.var(sharpes, ddof=1)) if len(sharpes) >= 2 else None
+
+
+def _enumerated(config_ids: Iterable[str]) -> Iterator[str]:
+    """The enumerated trials among `config_ids`: everything but a selection view, which is
+    chosen from them and so says nothing about how far the enumeration spread the Sharpe."""
+    return (config_id for config_id in config_ids if f"|{_IS_SELECTED}|" not in config_id)
 
 
 def run_tournament(
@@ -744,10 +859,18 @@ def run_tournament(
     pools each split's chosen exit over that split's *incremental* IS window, so no trade is
     counted twice.
 
-    ⚠ `n_trials` — what every deflated Sharpe is deflated by — is `len(matrix) + len(views)`:
-    the selection views are results of the same search and were themselves chosen by looking
-    at 16 exits per split, so counting only the enumerated matrix would under-deflate the
-    one view a reader is most likely to trade.
+    Each `(entry, exit, session)` and each view is then graded once more across the
+    instruments of a venue, as a **universe trial** `entry|exit|session|venue:*` (module
+    docstring): one more `split="pooled"` row each, no per-split rows, and only where at
+    least two instruments ran it.
+
+    ⚠ `n_trials` — what every deflated Sharpe is deflated by — is `len(matrix) + len(views)
+    + len(universe)`: the selection views are results of the same search and were themselves
+    chosen by looking at 16 exits per split, and a universe trial is one more candidate the
+    search put in front of the reader, so counting only the enumerated matrix would
+    under-deflate exactly the rows most likely to be traded. `trial_sr_variance` is taken
+    over the enumerated per-instrument trials only - never a view, and never a universe
+    trial (see `V_MIN_TRADES`).
 
     `seed` seeds both the gate's bootstraps and, per config, the entry factory (see
     `run_config`). Per-config trades and equity go to the store under
@@ -765,6 +888,8 @@ def run_tournament(
     run_id = run_id or f"tournament-{started:%Y%m%dT%H%M%S}"
     for name in exits:
         exit_rule(name)  # fail fast on a typo rather than 2,000 configs later
+    if any(instrument.symbol == UNIVERSE_SYMBOL for instrument in instruments):
+        raise ValueError(f"{UNIVERSE_SYMBOL!r} names a universe trial and cannot be an instrument's symbol")
     source = _MemoisedSource(store)
     store.upsert_instruments(instruments)  # `write_trades` resolves instruments through this table
 
@@ -805,15 +930,31 @@ def run_tournament(
         for config in matrix.configs
         if config.id in matrix.replayed
     }
-    trial_sr_variance = trial_variance(pooled.values())
-
     selection, views = _is_selected_views(
         matrix.replayed, splits_by_instrument, ordered, exits, sessions, windows
     )
     # Every view has to be in `pooled` before any row is built: a view's own rule-4 baseline
     # is `baseline|IS_SELECTED|session|instrument`, which is another view, and neither the
-    # matrix rows nor the view rows can be trusted to reach it first.
+    # matrix rows nor the view rows can be trusted to reach it first. The same goes for the
+    # universe trials, whose baseline is the `baseline` universe trial.
     pooled.update({config_id: tuple(view.oos_trades) for config_id, view in views.items()})
+    in_sample: dict[str, Sequence[Trade]] = {
+        config.id: _pooled_is(
+            matrix.replayed[config.id].trades, splits_by_instrument[instrument_key(config.instrument)]
+        )
+        for config in matrix.configs
+        if config.id in matrix.replayed
+    }
+    in_sample.update({config_id: view.is_trades for config_id, view in views.items()})
+    universe = _universe_trials(
+        list(windows), pooled, in_sample, entries=ordered, exits=(*exits, _IS_SELECTED), sessions=sessions
+    )
+    pooled.update({config_id: trial.oos_trades for config_id, trial in universe.items()})
+    # V stays a per-instrument measure: said in so many words rather than by computing it a
+    # line earlier, so that reordering this block cannot quietly let the universe trials in.
+    trial_sr_variance = trial_variance(
+        pooled[config_id] for config_id in _enumerated(pooled) if config_id not in universe
+    )
 
     context = _GateContext(
         run_id=run_id,
@@ -821,13 +962,14 @@ def run_tournament(
         splits=splits_by_instrument,
         closes=matrix.closes,
         pooled=pooled,
-        n_trials=len(matrix.configs) + len(views),
+        n_trials=len(matrix.configs) + len(views) + len(universe),
         seed=seed,
         trial_sr_variance=trial_sr_variance,
         gates={},
     )
     rows = _config_rows(matrix, context)
     rows.extend(_is_selected_rows(views, windows, matrix.resolution_modes, context))
+    rows.extend(_universe_rows(universe, matrix.resolution_modes, context))
 
     store.write_results(rows)
     return TournamentResult(
@@ -841,6 +983,7 @@ def run_tournament(
         oos_trades=pooled,
         n_trials=context.n_trials,
         trial_sr_variance=trial_sr_variance,
+        universe={config_id: trial.members for config_id, trial in universe.items()},
     )
 
 
@@ -1129,10 +1272,10 @@ def _is_selected_rows(
                 run_id=context.run_id,
                 ts=context.ts,
                 config_id=config_id,
-                identity=_identity_columns(entry, "IS_SELECTED", session, by_key[key]),
+                identity=_identity_columns(entry, _IS_SELECTED, session, by_key[key]),
                 is_trades=view.is_trades,
                 oos=view.oos_trades,
-                baseline=context.pooled.get(f"baseline|IS_SELECTED|{session}|{key}", ()),
+                baseline=context.pooled.get(f"baseline|{_IS_SELECTED}|{session}|{key}", ()),
                 closes=context.closes.get(key, ()),
                 splits=context.splits[key],
                 resolution_mode=resolution_modes.get(key),
@@ -1163,7 +1306,56 @@ def _pooled_row(
     gates: dict[str, GateResult],
     note: str | None = None,
 ) -> dict[str, Any]:
-    """Build the `split="pooled"` row for one config, running the gate on its pooled OOS.
+    """The `split="pooled"` row of one instrument's config or view: `_graded_row` against that
+    instrument's own buy-and-hold over its OOS windows."""
+    return _graded_row(
+        run_id=run_id,
+        ts=ts,
+        config_id=config_id,
+        identity=identity,
+        is_trades=is_trades,
+        oos=oos,
+        baseline=baseline,
+        benchmark=partial(_instrument_benchmark, closes, splits),
+        resolution_mode=resolution_mode,
+        n_trials=n_trials,
+        seed=seed,
+        trial_sr_variance=trial_sr_variance,
+        gates=gates,
+        note=note,
+    )
+
+
+def _instrument_benchmark(
+    closes: Sequence[tuple[datetime, float]], splits: Sequence[Split]
+) -> tuple[list[float], float]:
+    """Rule 5's benchmark curve and the `years` it shares with the config, for one instrument."""
+    return buy_and_hold_curve(closes, [(s.oos_start, s.oos_end) for s in splits]), oos_years(splits)
+
+
+def _graded_row(
+    *,
+    run_id: str,
+    ts: datetime,
+    config_id: str,
+    identity: dict[str, Any],
+    is_trades: Sequence[Trade],
+    oos: Sequence[Trade],
+    baseline: Sequence[Trade],
+    benchmark: Callable[[], tuple[Sequence[float], float]],
+    resolution_mode: str | None,
+    n_trials: int,
+    seed: int,
+    trial_sr_variance: float | None,
+    gates: dict[str, GateResult],
+    note: str | None = None,
+    effective_n: int | None = None,
+) -> dict[str, Any]:
+    """Build the `split="pooled"` row for one trial, running the gate on its pooled OOS.
+
+    `benchmark` returns rule 5's buy-and-hold curve and the `years` both MAR figures share;
+    it is called inside the guard below because building it can itself fail. `effective_n`
+    is rule 2's independent-observation count, given for a universe trial only.
 
     A config whose gate cannot be evaluated at all — `equity_curve_from_r` refusing a
     ruinous R multiple, an empty buy-and-hold window, a zero-length OOS span — still gets
@@ -1182,15 +1374,17 @@ def _pooled_row(
         "resolution_mode": resolution_mode,
     }
     try:
+        bh_curve, years = benchmark()
         result = gate.evaluate(
             realized_rs(oos),
             realized_rs(baseline),
-            buy_and_hold_curve(closes, [(s.oos_start, s.oos_end) for s in splits]),
-            years=oos_years(splits),
+            bh_curve,
+            years=years,
             n_trials=n_trials,
             stressed_r=[stressed_r(t) for t in oos],
             seed=seed,
             trial_sr_variance=trial_sr_variance,
+            effective_n=effective_n,
         )
     except Exception as exc:  # a blown-up config is a failed row, not a lost run
         logger.exception("tournament config %s could not be graded", config_id)
@@ -1246,7 +1440,7 @@ def _is_selected_views(
                 view = _select_exits(replayed, splits, entry, session, key, exits)
                 if not view.chosen:
                     continue
-                config_id = f"{entry}|IS_SELECTED|{session}|{key}"
+                config_id = f"{entry}|{_IS_SELECTED}|{session}|{key}"
                 selection[config_id] = view.chosen
                 views[config_id] = view
     return selection, views
@@ -1286,3 +1480,146 @@ def _select_exits(
         oos_trades.extend(window_oos)
         previous_is_end = split.is_end
     return _ISSelectedView(chosen=chosen, is_trades=is_trades, oos_trades=oos_trades)
+
+
+# --- universe trials ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _UniverseTrial:
+    """One `(entry, exit, session)` graded across the instruments of a venue that ran it.
+
+    `exit` is an `EXIT_GRID` name or `IS_SELECTED`. `members` are instrument keys, sorted;
+    both trade series are the members' own, merged chronologically (`_merged`).
+    """
+
+    entry: str
+    exit: str
+    session: str
+    venue: str
+    members: tuple[str, ...]
+    is_trades: tuple[Trade, ...]
+    oos_trades: tuple[Trade, ...]
+
+    @property
+    def id(self) -> str:
+        return f"{self.entry}|{self.exit}|{self.session}|{self.venue}:{UNIVERSE_SYMBOL}"
+
+
+def _merged(series: Iterable[Sequence[Trade]]) -> tuple[Trade, ...]:
+    """Several instruments' trades as one chronological series, by entry time.
+
+    Entry time is what assigns a trade to a split, and it puts trades that were open together
+    next to each other, which is what the gate's block bootstrap needs from the order. Entries
+    on the same bar - the common case on instruments that move together - are ordered by
+    instrument and then id, so the series never depends on the order the members arrived in.
+    """
+    return tuple(
+        sorted(
+            (trade for trades in series for trade in trades),
+            key=lambda trade: (trade.entry_fill.ts, instrument_key(trade.instrument), trade.id),
+        )
+    )
+
+
+def _universe_trials(
+    instruments: Sequence[Instrument],
+    pooled: Mapping[str, Sequence[Trade]],
+    in_sample: Mapping[str, Sequence[Trade]],
+    *,
+    entries: Sequence[str],
+    exits: Sequence[str],
+    sessions: Sequence[str],
+) -> dict[str, _UniverseTrial]:
+    """Every `(entry, exit, session)` that at least two instruments of one venue ran, pooled.
+
+    An instrument is a member when its own config id is in `pooled` - it replayed, or (for
+    `IS_SELECTED`) some split had enough IS trades to choose an exit - whether or not it
+    traded out of sample: the entry was live on it, so it belongs in the benchmark, in rule 4's
+    baseline (its `baseline` trades are what a random entry made there in the same windows)
+    and in the list of instruments a pass would be enabled on. But a trial is only formed when at least
+    two members hold OOS trades. With one, the pooled series *is* that instrument's own trial
+    under a second name - a duplicate in the search and nothing new in the evidence - so it is
+    skipped; venues are never mixed.
+    """
+    keys_by_venue: dict[str, list[str]] = {}
+    for instrument in instruments:
+        keys_by_venue.setdefault(instrument.venue, []).append(instrument_key(instrument))
+    trials: dict[str, _UniverseTrial] = {}
+    for venue in sorted(keys_by_venue):
+        keys = sorted(keys_by_venue[venue])
+        for entry in entries:
+            for exit_name in exits:
+                for session in sessions:
+                    stem = f"{entry}|{exit_name}|{session}|"
+                    members = tuple(key for key in keys if stem + key in pooled)
+                    if sum(1 for key in members if pooled[stem + key]) < 2:
+                        continue
+                    trial = _UniverseTrial(
+                        entry=entry,
+                        exit=exit_name,
+                        session=session,
+                        venue=venue,
+                        members=members,
+                        is_trades=_merged(in_sample.get(stem + key, ()) for key in members),
+                        oos_trades=_merged(pooled[stem + key] for key in members),
+                    )
+                    trials[trial.id] = trial
+    return trials
+
+
+def _universe_benchmark(
+    members: tuple[str, ...],
+    context: _GateContext,
+    cache: dict[tuple[str, ...], tuple[list[float], float]],
+) -> tuple[list[float], float]:
+    """Rule 5's benchmark for a universe trial; computed once per distinct member set."""
+    if members not in cache:
+        windows = {key: [(s.oos_start, s.oos_end) for s in context.splits[key]] for key in members}
+        curve = universe_buy_and_hold_curve({key: context.closes.get(key, ()) for key in members}, windows)
+        cache[members] = (curve, union_years(window for key in members for window in windows[key]))
+    return cache[members]
+
+
+def _universe_rows(
+    universe: Mapping[str, _UniverseTrial],
+    resolution_modes: Mapping[str, str],
+    context: _GateContext,
+) -> list[dict[str, Any]]:
+    """The pooled `results` row for each universe trial; see `_universe_trials`."""
+    cache: dict[tuple[str, ...], tuple[list[float], float]] = {}
+    rows: list[dict[str, Any]] = []
+    for config_id, trial in universe.items():
+        modes = {resolution_modes.get(key) for key in trial.members}
+        # one mode if the members agree, `mixed` if they do not, unknown if any of them is
+        mode = None if None in modes else (next(iter(modes)) if len(modes) == 1 else "mixed")
+        rows.append(
+            _graded_row(
+                run_id=context.run_id,
+                ts=context.ts,
+                config_id=config_id,
+                identity={
+                    "entry": trial.entry,
+                    "exit": trial.exit,
+                    "session": trial.session,
+                    "venue": trial.venue,
+                    "symbol": UNIVERSE_SYMBOL,
+                },
+                is_trades=trial.is_trades,
+                oos=trial.oos_trades,
+                # the baseline of exactly these members, not the `baseline` universe trial:
+                # that one pools whoever ran `baseline`, which differs after a config error
+                baseline=_merged(
+                    context.pooled.get(f"baseline|{trial.exit}|{trial.session}|{key}", ())
+                    for key in trial.members
+                ),
+                benchmark=partial(_universe_benchmark, trial.members, context, cache),
+                effective_n=entry_days(trial.oos_trades) or None,
+                resolution_mode=mode,
+                n_trials=context.n_trials,
+                seed=context.seed,
+                trial_sr_variance=context.trial_sr_variance,
+                gates=context.gates,
+            )
+        )
+    return rows

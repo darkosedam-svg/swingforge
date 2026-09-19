@@ -296,12 +296,17 @@ def regime_breakdown(stores: dict[str, Store], run_id: str) -> list[dict[str, An
     ]
 
 
+_UNIVERSE_SYMBOL = "*"
+"""`swingforge.lab.tournament.UNIVERSE_SYMBOL`, restated: that module pulls in the strategies
+and the paper broker, which the `web-is-read-only` import contract keeps out of this package."""
+
+
 def _resolution_modes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: dict[tuple[Any, Any], Any] = {}
     for row in rows:
         key = (row.get("venue"), row.get("symbol"))
-        if key == (None, None):
-            continue
+        if key == (None, None) or row.get("symbol") == _UNIVERSE_SYMBOL:
+            continue  # a universe row pools instruments; it is not one
         seen.setdefault(key, row.get("resolution_mode"))
     return [
         {"venue": venue, "symbol": symbol, "resolution_mode": mode} for (venue, symbol), mode in seen.items()
@@ -312,7 +317,9 @@ _CAPPED_TOP_N = 50
 """How many rows `_capped_rows` keeps purely on `exp_oos` rank, independent of `passed`/`exit`."""
 
 
-def _capped_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+def _capped_rows(
+    rows: list[dict[str, Any]], *, rule_1_first: bool = False
+) -> tuple[list[dict[str, Any]], int]:
     """Every passing config, the top `_CAPPED_TOP_N` by ``exp_oos``, and every ``IS_SELECTED``
     row -- deduplicated, in ``rows``' original relative order -- plus how many rows that left
     out.
@@ -323,13 +330,17 @@ def _capped_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]
     Deterministic because `sorted` is stable: ties in `exp_oos` keep ``rows``' original order,
     which is itself fixed by the caller (one ``ORDER BY ts`` query per store, in store-iteration
     order) -- not left to per-call dict/set iteration.
+
+    `rule_1_first` ranks the rows that cleared rule 1 ahead of the rest, for the universe
+    rows: a full sweep holds ~150 of them, most of them thin pools whose few trades flatter
+    their expectancy, and ranked on `exp_oos` alone they push the handful the gate could
+    actually grade out of the cap.
     """
-    top_indices = {
-        i
-        for i, _ in sorted(enumerate(rows), key=lambda pair: _exp_oos_sort_key(pair[1]), reverse=True)[
-            :_CAPPED_TOP_N
-        ]
-    }
+
+    def rank(pair: tuple[int, dict[str, Any]]) -> tuple[bool, float]:
+        return (rule_1_first and pair[1].get("g1") is True, _exp_oos_sort_key(pair[1]))
+
+    top_indices = {i for i, _ in sorted(enumerate(rows), key=rank, reverse=True)[:_CAPPED_TOP_N]}
     keep_indices = {
         i
         for i, row in enumerate(rows)
@@ -340,10 +351,21 @@ def _capped_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]
 
 
 def tournament_payload(stores: dict[str, Store], run_id: str) -> dict[str, Any]:
-    """The full ``/api/tournament/latest`` payload for the given (already-chosen) ``run_id``."""
-    rows: list[dict[str, Any]] = []
+    """The full ``/api/tournament/latest`` payload for the given (already-chosen) ``run_id``.
+
+    Universe rows (``symbol == "*"``: one entry, exit and session graded across a venue's
+    instruments) are served under ``universe`` and kept out of ``gate``, ``top``,
+    ``selected`` and ``cost_stress``: they are the only rows that reach rule 1's sample on a
+    short history, and unmarked they would crowd every instrument's own row out of those
+    lists. Rows that cleared rule 1 lead ``universe``, as in the markdown report.
+    """
+    every_row: list[dict[str, Any]] = []
     for store in stores.values():
-        rows.extend(_sanitize_result_row(row) for row in store.results(run_id))
+        every_row.extend(_sanitize_result_row(row) for row in store.results(run_id))
+    rows = [row for row in every_row if row.get("symbol") != _UNIVERSE_SYMBOL]
+    universe_rows, universe_omitted = _capped_rows(
+        [row for row in every_row if row.get("symbol") == _UNIVERSE_SYMBOL], rule_1_first=True
+    )
 
     def gate_key(row: dict[str, Any]) -> tuple[bool, float]:
         return (row.get("passed") is True, _exp_oos_sort_key(row))
@@ -352,24 +374,35 @@ def tournament_payload(stores: dict[str, Store], run_id: str) -> dict[str, Any]:
     gate = sorted(capped_rows, key=gate_key, reverse=True)
     top = sorted(rows, key=_exp_oos_sort_key, reverse=True)[:20]
     selected = [row for row in rows if row.get("exit") == "IS_SELECTED"]
-    excluded = [row for row in rows if row.get("excluded_reason") is not None]
+    excluded = [row for row in every_row if row.get("excluded_reason") is not None]
+    universe = sorted(
+        universe_rows,
+        key=lambda row: (
+            row.get("passed") is not True,
+            row.get("g1") is not True,
+            -_exp_oos_sort_key(row),
+            str(row.get("config_id")),
+        ),
+    )
     cost_stress = [
         {"config_id": row.get("config_id"), "exp_oos": row.get("exp_oos"), "g6": row.get("g6")}
         for row in capped_rows
     ]
-    ts = max((row["ts"] for row in rows if row.get("ts") is not None), default=None)
+    ts = max((row["ts"] for row in every_row if row.get("ts") is not None), default=None)
     return {
         "run_id": run_id,
         "ts": ts,
         "gate": gate,
         "gate_omitted": omitted,
+        "universe": universe,
+        "universe_omitted": universe_omitted,
         "top": top,
         "selected": selected,
         "regime": regime_breakdown(stores, run_id),
         "cost_stress": cost_stress,
         "cost_stress_omitted": omitted,
         "excluded": excluded,
-        "resolution_modes": _resolution_modes(rows),
+        "resolution_modes": _resolution_modes(rows),  # `rows` holds no universe row
     }
 
 

@@ -807,6 +807,121 @@ def test_tournament_resolution_modes_skips_rows_with_no_venue_or_symbol(data_dir
     assert body["gate"][0]["passed"] is None
 
 
+def test_tournament_payload_serves_universe_rows_apart(data_dir: Path) -> None:
+    """A `venue:*` row pools instruments: it is not an instrument with a fill mode of its own,
+    and unmarked in `gate`/`top`/`cost_stress` it would crowd the instruments' own rows out."""
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    shared = {
+        "run_id": "run-u",
+        "ts": ts,
+        "split": "pooled",
+        "venue": "hyperliquid",
+        "entry": "ict",
+        "session": "none",
+    }
+    btc = "ict|fixed_r_2|none|hyperliquid:BTC"
+    thin = "ict|fixed_r_3|none|hyperliquid:*"
+    graded = "ict|fixed_r_2|none|hyperliquid:*"
+    view = "ict|IS_SELECTED|none|hyperliquid:*"
+    with _hl_store(data_dir) as store:
+        store.write_results(
+            [
+                {
+                    **shared,
+                    "config_id": btc,
+                    "exit": "fixed_r_2",
+                    "symbol": "BTC",
+                    "exp_oos": 0.1,
+                    "resolution_mode": "subbars",
+                },
+                {
+                    **shared,
+                    "config_id": thin,
+                    "exit": "fixed_r_3",
+                    "symbol": "*",
+                    "exp_oos": 9.0,
+                    "g1": False,
+                    "passed": False,
+                    "resolution_mode": "mixed",
+                },
+                {
+                    **shared,
+                    "config_id": graded,
+                    "exit": "fixed_r_2",
+                    "symbol": "*",
+                    "exp_oos": 0.2,
+                    "g1": True,
+                    "passed": False,
+                    "resolution_mode": "mixed",
+                },
+                {
+                    **shared,
+                    "config_id": view,
+                    "exit": "IS_SELECTED",
+                    "symbol": "*",
+                    "exp_oos": 0.3,
+                    "g1": False,
+                    "passed": False,
+                    "resolution_mode": "mixed",
+                },
+            ]
+        )
+    client = TestClient(create_app(data_dir=data_dir))
+    body = client.get("/api/tournament/latest").json()
+    assert body["resolution_modes"] == [
+        {"venue": "hyperliquid", "symbol": "BTC", "resolution_mode": "subbars"}
+    ]
+    for key in ("gate", "top", "cost_stress"):
+        assert [row["config_id"] for row in body[key]] == [btc], key
+    assert body["selected"] == []
+    # the row that cleared rule 1 leads, whatever a thinner pool's expectancy says
+    assert [row["config_id"] for row in body["universe"]] == [graded, thin, view]
+    assert body["universe_omitted"] == 0
+
+
+def test_the_universe_cap_keeps_the_rows_that_cleared_rule_1(data_dir: Path) -> None:
+    """A full sweep holds ~150 universe rows, most of them thin pools whose few trades flatter
+    their expectancy. Capped on `exp_oos` alone they would push out the handful the gate could
+    grade - the only rows the table exists to show."""
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    shared = {"run_id": "run-cap", "ts": ts, "split": "pooled", "venue": "hyperliquid", "symbol": "*"}
+    thin = [
+        {
+            **shared,
+            "config_id": f"zones|thin_{i:02d}|none|hyperliquid:*",
+            "entry": "zones",
+            "exit": f"thin_{i:02d}",
+            "session": "none",
+            "exp_oos": 1.0 + i / 100,
+            "g1": False,
+            "passed": False,
+        }
+        for i in range(60)
+    ]
+    graded = [
+        {
+            **shared,
+            "config_id": f"ict|graded_{i}|none|hyperliquid:*",
+            "entry": "ict",
+            "exit": f"graded_{i}",
+            "session": "none",
+            "exp_oos": 0.12,
+            "g1": True,
+            "passed": False,
+        }
+        for i in range(6)
+    ]
+    with _hl_store(data_dir) as store:
+        store.write_results([*thin, *graded])
+    client = TestClient(create_app(data_dir=data_dir))
+    body = client.get("/api/tournament/latest").json()
+    served = [row["config_id"] for row in body["universe"]]
+    assert len(served) == 50 and body["universe_omitted"] == 16
+    # equal expectancies: the config id breaks the tie, so the order never rests on scan order
+    assert served[:6] == [f"ict|graded_{i}|none|hyperliquid:*" for i in range(6)]
+    assert body["gate"] == [] and body["top"] == []
+
+
 def test_tournament_regime_breakdown_weighted_across_stores(data_dir: Path) -> None:
     """I1: the cross-store merge must be n-weighted, not a plain average of each store's own
     average -- this distinguishes the correct (1+2+3+10)/4=4.0 from the naive (2.0+10.0)/2=6.0."""

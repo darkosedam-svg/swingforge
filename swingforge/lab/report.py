@@ -15,6 +15,13 @@ a person reads. The three per-config tables (gate, excursion, cost stress) there
 every config that *passed*, the `top_n` best by out-of-sample expectancy and every
 `IS_SELECTED` view, and count the rest in a line under the table. The `results` table is
 the complete record and the report says so in its own first line.
+
+**Universe trials** (`entry|exit|session|venue:*`, see `swingforge.lab.tournament`) get a
+gate table of their own, ranked so the rows that clear rule 1 come first, and are kept out
+of the per-instrument gate and top-configs tables, where a pooled sample would crowd out
+every instrument's own. The rows that table shows also appear in the excursion and
+cost-stress tables - rule 6 was graded on them too - where the config-id order puts each one
+beside its members' rows.
 """
 
 from __future__ import annotations
@@ -27,7 +34,13 @@ from typing import Any
 from swingforge.core.types import Trade
 from swingforge.lab.excursion import ExcursionSummary, excursion_summary
 from swingforge.lab.gate import GateResult
-from swingforge.lab.tournament import TournamentResult, expectancy, stressed_r
+from swingforge.lab.tournament import (
+    UNIVERSE_SYMBOL,
+    TournamentResult,
+    entry_days,
+    expectancy,
+    stressed_r,
+)
 
 __all__ = ["render", "write_report"]
 
@@ -46,6 +59,21 @@ _NO = "✗"
 _DECIMALS = 3
 
 _IS_SELECTED = "IS_SELECTED"
+
+_UNIVERSE_NOTE = (
+    "Each entry, exit and session graded once more on the out-of-sample trades of every "
+    "instrument of the venue together (`venue:*`), against the pooled baseline and an "
+    "equal-weight buy-and-hold of the same instruments. Instruments of one venue move together, "
+    "so these trades are not independent draws: `entry days` counts the distinct days they were "
+    "entered on, and it is the sample size rule 2 reads the row at: a smaller sample shrinks the "
+    "z-score and, when no cross-trial variance could be measured, also raises the Sharpe it is "
+    "measured against. Rule 1 counts trades, so a row can clear it on fewer than 60 entry "
+    "days - read the two columns together. MAR is not comparable with the table above: a pooled row "
+    "holds one stream of bets per instrument. A row that "
+    "passes is a verdict on the instruments traded together, to be enabled on each instrument "
+    "its `instruments` cell names - every instrument the config ran on, whether or not it traded "
+    "out of sample, and all of them are in the benchmark. Rows that clear rule 1 rank first."
+)
 
 
 def _number(value: float | None) -> str:
@@ -89,17 +117,34 @@ def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
     return lines
 
 
-def _pooled_rows(result: TournamentResult) -> list[dict[str, Any]]:
-    """The `split="pooled"` rows, in a stable order: passed first, then expectancy, then id."""
+def _pooled_rows(result: TournamentResult, *, universe: bool = False) -> list[dict[str, Any]]:
+    """The `split="pooled"` rows of the instruments - or, with `universe=True`, of the universe
+    trials - in a stable order: passed first, then expectancy, then id. Universe rows put the
+    ones that cleared rule 1 ahead of the rest (see `_shown_rows`), so the table reads in the
+    order it was cut."""
 
-    def key(row: dict[str, Any]) -> tuple[bool, float, str]:
+    def key(row: dict[str, Any]) -> tuple[bool, bool, float, str]:
         exp = row["exp_oos"]
-        return (row["passed"] is not True, -(exp if exp is not None else -math.inf), row["config_id"])
+        return (
+            row["passed"] is not True,
+            universe and row["g1"] is not True,
+            -(exp if exp is not None else -math.inf),
+            row["config_id"],
+        )
 
-    return sorted((row for row in result.rows if row["split"] == "pooled"), key=key)
+    return sorted(
+        (
+            row
+            for row in result.rows
+            if row["split"] == "pooled" and (row["symbol"] == UNIVERSE_SYMBOL) is universe
+        ),
+        key=key,
+    )
 
 
-def _shown_rows(pooled: Sequence[dict[str, Any]], top_n: int) -> tuple[list[dict[str, Any]], int]:
+def _shown_rows(
+    pooled: Sequence[dict[str, Any]], top_n: int, *, rule_1_first: bool = False
+) -> tuple[list[dict[str, Any]], int]:
     """The pooled rows the per-config tables show, and how many that leaves out.
 
     Every config that passed the gate, the `top_n` best by out-of-sample expectancy among
@@ -110,10 +155,14 @@ def _shown_rows(pooled: Sequence[dict[str, Any]], top_n: int) -> tuple[list[dict
     never produced an expectancy (its replay failed) is never shown: its row would be a line
     of en dashes, and the `Excluded` section names it with its reason. `pooled`'s own order
     is kept, so the choice is deterministic.
+
+    `rule_1_first` ranks the rows that cleared rule 1 ahead of the rest. The universe table
+    asks for it: pooling exists to reach rule 1's sample, and a three-trade pool with a
+    flattering expectancy would otherwise take the slot of the one row the gate could grade.
     """
     graded = sorted(
         (row for row in pooled if row["exp_oos"] is not None and row["exit"] != _IS_SELECTED),
-        key=lambda row: (-row["exp_oos"], row["config_id"]),
+        key=lambda row: (rule_1_first and row["g1"] is not True, -row["exp_oos"], row["config_id"]),
     )
     keep = {row["config_id"] for row in graded[:top_n]}
     keep |= {row["config_id"] for row in pooled if row["passed"] is True or row["exit"] == _IS_SELECTED}
@@ -143,59 +192,94 @@ def _heading(text: str, level: int = 2) -> list[str]:
     return ["#" * level + " " + text, ""]
 
 
+_GATE_HEADERS = (
+    "n_oos",
+    "exp_is",
+    "exp_oos",
+    "dsr prob",
+    "boot p5",
+    "diff p5",
+    "MAR",
+    "B&H MAR",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "passed",
+)
+
+
+def _gate_cells(result: TournamentResult, row: dict[str, Any]) -> list[str]:
+    """One row of a gate table from `n_oos` on, in `_GATE_HEADERS` order."""
+    gate = _gate_of(result, row["config_id"])
+    rules = (
+        gate.rules()
+        if gate is not None
+        else dict.fromkeys(("rule1", "rule2", "rule3", "rule4", "rule5", "rule6"))
+    )
+    return [
+        _MISSING if row["n_oos"] is None else str(row["n_oos"]),
+        _number(row["exp_is"]),
+        _number(row["exp_oos"]),
+        _number(gate.dsr.prob if gate is not None and gate.dsr is not None else None),
+        _number(gate.boot_p5 if gate is not None else None),
+        _number(gate.diff_p5 if gate is not None else None),
+        _number(gate.mar_config if gate is not None else None),
+        _number(gate.mar_bh if gate is not None else None),
+        *(_flag(rules[name]) for name in ("rule1", "rule2", "rule3", "rule4", "rule5", "rule6")),
+        _flag(None if gate is None else gate.passed),
+    ]
+
+
+def _ungraded_note(pooled: Sequence[dict[str, Any]]) -> list[str]:
+    """How many rows have no verdict at all, or nothing when every row has one.
+
+    `passed is None`, not `excluded_reason is not None`: a config whose ledger failed to
+    store carries a reason and a verdict, and is not one of the ones that could not run.
+    """
+    failures = [row for row in pooled if row["passed"] is None]
+    if not failures:
+        return []
+    return [f"{len(failures)} config(s) could not be graded; their reason is in the last section.", ""]
+
+
 def _gate_table(
     result: TournamentResult, pooled: Sequence[dict[str, Any]], shown: Sequence[dict[str, Any]], omitted: int
 ) -> list[str]:
-    headers = [
-        "config",
-        "n_oos",
-        "exp_is",
-        "exp_oos",
-        "dsr prob",
-        "boot p5",
-        "diff p5",
-        "MAR",
-        "B&H MAR",
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "passed",
-    ]
-    rows: list[list[str]] = []
-    for row in shown:
-        gate = _gate_of(result, row["config_id"])
-        rules = (
-            gate.rules()
-            if gate is not None
-            else dict.fromkeys(("rule1", "rule2", "rule3", "rule4", "rule5", "rule6"))
-        )
-        rows.append(
-            [
-                row["config_id"],
-                _MISSING if row["n_oos"] is None else str(row["n_oos"]),
-                _number(row["exp_is"]),
-                _number(row["exp_oos"]),
-                _number(gate.dsr.prob if gate is not None and gate.dsr is not None else None),
-                _number(gate.boot_p5 if gate is not None else None),
-                _number(gate.diff_p5 if gate is not None else None),
-                _number(gate.mar_config if gate is not None else None),
-                _number(gate.mar_bh if gate is not None else None),
-                *(_flag(rules[name]) for name in ("rule1", "rule2", "rule3", "rule4", "rule5", "rule6")),
-                _flag(None if gate is None else gate.passed),
-            ]
-        )
     lines = _heading("Gate")
-    # `passed is None`, not `excluded_reason is not None`: a config whose ledger failed to
-    # store carries a reason and a verdict, and is not one of the ones that could not run.
-    failures = [row for row in pooled if row["passed"] is None]
-    if failures:
-        lines.append(f"{len(failures)} config(s) could not be graded; their reason is in the last section.")
-        lines.append("")
+    lines.extend(_ungraded_note(pooled))
     lines.extend(_omitted_note(omitted))
-    lines.extend(_table(headers, rows))
+    lines.extend(
+        _table(["config", *_GATE_HEADERS], [[row["config_id"], *_gate_cells(result, row)] for row in shown])
+    )
+    return lines
+
+
+def _members(keys: Sequence[str]) -> str:
+    """`2 (BTC, ETH)`: how many instruments a universe row pools, and which - the ones to
+    enable if it passes, which no other part of the report names."""
+    return f"{len(keys)} ({', '.join(key.partition(':')[2] for key in keys)})"
+
+
+def _universe_table(
+    result: TournamentResult, pooled: Sequence[dict[str, Any]], shown: Sequence[dict[str, Any]], omitted: int
+) -> list[str]:
+    rows = [
+        [
+            row["config_id"],
+            _members(result.universe.get(row["config_id"], ())),
+            str(entry_days(result.oos_trades.get(row["config_id"], ()))),
+            *_gate_cells(result, row),
+        ]
+        for row in shown
+    ]
+    lines = _heading("Gate, pooled across instruments")
+    lines.extend([_UNIVERSE_NOTE, ""])
+    lines.extend(_ungraded_note(pooled))
+    lines.extend(_omitted_note(omitted))
+    lines.extend(_table(["config", "instruments", "entry days", *_GATE_HEADERS], rows))
     return lines
 
 
@@ -238,9 +322,15 @@ def _regime_table(result: TournamentResult) -> list[str]:
         else "No config passed the gate, so this is pooled over every config that ran."
     )
     buckets: dict[str, list[float]] = {}
+    # A universe trial's trades are its members' trades, so a trade is counted once per
+    # (entry, exit, session) however many rows of `scope` hold it - in either branch above.
+    seen: set[tuple[str, str, str, str]] = set()
     for config_id in scope:
+        stem = config_id.rsplit("|", 1)[0]
         for trade in result.oos_trades.get(config_id, ()):
-            if trade.realized_r is not None:
+            key = (stem, trade.instrument.venue, trade.instrument.symbol, trade.id)
+            if trade.realized_r is not None and key not in seen:
+                seen.add(key)
                 buckets.setdefault(trade.regime or _MISSING, []).append(trade.realized_r)
     rows = [[regime, str(len(rs)), _number(sum(rs) / len(rs))] for regime, rs in sorted(buckets.items())]
     lines = _heading("Regime breakdown")
@@ -371,20 +461,27 @@ def render(
     lines = [f"# swingforge tournament {result.run_id}", "", _HEADER_NOTE, ""]
     pooled = _pooled_rows(result)
     shown, omitted = _shown_rows(pooled, top_n)
+    universe = _pooled_rows(result, universe=True)
+    universe_shown, universe_omitted = _shown_rows(universe, top_n, rule_1_first=True)
+    # the excursion and cost-stress tables cover every row either gate table shows (they
+    # sort on the config id, which puts a universe row beside its members')
+    detailed = [*shown, *universe_shown]
     # once per config, not once per table: both walk the same pooled OOS trade lists
     excursions = {
-        row["config_id"]: excursion_summary(result.oos_trades.get(row["config_id"], ())) for row in shown
+        row["config_id"]: excursion_summary(result.oos_trades.get(row["config_id"], ())) for row in detailed
     }
     stressed = {
-        row["config_id"]: _stressed_expectancy(result.oos_trades.get(row["config_id"], ())) for row in shown
+        row["config_id"]: _stressed_expectancy(result.oos_trades.get(row["config_id"], ()))
+        for row in detailed
     }
     lines.extend(_gate_table(result, pooled, shown, omitted))
+    lines.extend(_universe_table(result, universe, universe_shown, universe_omitted))
     lines.extend(_top_configs(pooled, top_n))
     lines.extend(_selection_table(result))
     lines.extend(_regime_table(result))
-    lines.extend(_excursion_table(shown, omitted, excursions, raw_signal))
-    lines.extend(_cost_stress_table(result, shown, omitted, stressed))
-    lines.extend(_excluded_table(result, pooled))
+    lines.extend(_excursion_table(detailed, omitted + universe_omitted, excursions, raw_signal))
+    lines.extend(_cost_stress_table(result, detailed, omitted + universe_omitted, stressed))
+    lines.extend(_excluded_table(result, [*pooled, *universe]))
     lines.extend(_resolution_table(result))
     return "\n".join(lines).rstrip("\n") + "\n"
 

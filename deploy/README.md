@@ -220,6 +220,13 @@ only recognises the auto-generated `tournament:<venue>:...` ids; a custom `--run
 passed explicitly.) Everything else lives in the markdown report `tournament` wrote under
 `/var/lib/swingforge/reports/` (it prints the exact path):
 - the full gate table with every rule's verdict,
+- the same gate for every entry, exit and session **pooled across the venue's instruments**
+  (config ids ending `:*`, e.g. `ict|fixed_r_2|none|hyperliquid:*`) - the table to read when
+  no single instrument reaches rule 1's 60 out-of-sample trades. Its `instruments` column
+  names the instruments the row pools and `entry days` is the distinct days its trades were
+  entered on, which is the sample size rule 2 reads it at. Rule 1 counts trades, so a pooled
+  row can clear it on fewer than 60 entry days: read `n_oos` and `entry days` together, and
+  treat a row whose entry days fall short of 60 as thinner than its rule-1 tick suggests,
 - IS vs OOS for the top configs,
 - the regime and excursion breakdowns,
 - the cost-stress (2x spread/slippage, 1.5x funding) columns,
@@ -235,6 +242,14 @@ a query issued while backfill/tournament/paper holds the file fails with
 `duckdb.IOException`; wait for that process to release the file and retry.
 
 ## 7. Enable a gate-passed config for paper
+
+A passing id that ends in `:*` is a verdict on that entry, exit and session **traded on all
+of the venue's pooled instruments together**, not on any one of them, and `swingforge paper`
+refuses it. Enable it as one instance per instrument - the same id with each symbol in place
+of the `*`, for exactly the symbols that row's `instruments` cell names in the report's
+`Gate, pooled across instruments` table (an instrument whose config errored is not among
+them) - and judge step 8's check on the instances together, not one by one: no single
+instrument was shown to carry the edge.
 
 `swingforge paper` only accepts `ict`/`zones` entry configs - a `baseline` config id (it
 exists only to prove the gate rejects noise) is refused outright and never runs as paper,

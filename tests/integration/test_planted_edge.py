@@ -15,13 +15,16 @@ What must then hold:
   satisfied — so the failure is the statistics talking, not an empty sample;
 * on a **plain random walk with nothing planted at all** (spec section 8), nothing clears
   them either — for `zones` and the frequency-matched `baseline` as well as `ict`, not just
-  the pair the planted comparison above already covers.
+  the pair the planted comparison above already covers;
+* on **five identical copies of that walk** nothing clears them either, the universe trials
+  included — pooling instruments that move as one hands the gate the same trades five times,
+  and that must buy no significance.
 
 The gate figures behind both verdicts are printed (visible under `pytest -s`, and repeated in
 every failure message) so a human can read what the run actually decided.
 
-Slow: three full tournaments (two four-year, one two-year), a little under two minutes end to
-end. Run with `uv run pytest -q -m slow tests/integration`.
+Slow: four full tournaments, about two minutes end to end. Run with
+`uv run pytest -q -m slow tests/integration`.
 """
 
 from __future__ import annotations
@@ -38,17 +41,19 @@ from swingforge.core.context import Context
 from swingforge.core.costs import NullCostModel
 from swingforge.core.types import Signal
 from swingforge.lab.gate import deflated_sharpe
-from swingforge.lab.tournament import TournamentResult, realized_rs, run_tournament
+from swingforge.lab.tournament import TournamentResult, entry_days, realized_rs, run_tournament
 from swingforge.strategies.ict import ICT
 from swingforge.strategies.levels import swing_highs, swing_lows
 from tests.integration.conftest import PLANTED_SEED, PLANTED_YEARS, WALK, WALK_SEED
 from tests.integration.synth import (
     PLANTED,
+    SYNTH_START,
     planted_setups,
     random_walk_store,
     real_entry_factory,
     real_session_factory,
 )
+from tests.unit.synth_store import add_instrument
 
 pytestmark = pytest.mark.slow
 
@@ -337,3 +342,76 @@ def test_nothing_passes_on_a_pure_random_walk(random_walk_result: TournamentResu
             f"the n>={MIN_OOS_TRADES} floor was lifted (dsr.prob={dsr.prob})\n"
             f"observed n_oos per config: {counts}\n{report}"
         )
+
+
+# --- the cloned random walk: pooling must not manufacture significance ----------------
+
+CLONES = 5
+"""Copies of one walk pooled into each universe trial. Identical series are the worst case of
+instruments that move together: every `ict` trade exists `CLONES` times, on the same bars."""
+
+CLONE_EXITS = EXITS[:2]
+
+
+@pytest.fixture(scope="module")
+def cloned_walk_result() -> TournamentResult:
+    clones = [WALK.model_copy(update={"symbol": f"WALK{index}"}) for index in range(CLONES)]
+    store = Store(":memory:")
+    try:
+        for clone in clones:  # the same seed for every clone: the same bars under five symbols
+            add_instrument(store, clone, start=SYNTH_START, months=RANDOM_WALK_YEARS * 12, seed=WALK_SEED)
+        return run_tournament(
+            store,
+            clones,
+            entry_factory=real_entry_factory,
+            session_factory=real_session_factory,
+            cost_model=NullCostModel(),
+            entries=ENTRIES,
+            exits=CLONE_EXITS,
+            sessions=SESSIONS,
+            seed=SEED,
+        )
+    finally:
+        store.close()
+
+
+def test_pooling_clones_of_a_random_walk_passes_nothing(cloned_walk_result: TournamentResult) -> None:
+    report = _report(cloned_walk_result, f"{CLONES} clones of a pure random walk")
+    print(report)
+
+    passing = [row["config_id"] for row in _pooled(cloned_walk_result) if row["passed"] is True]
+    assert passing == [], report
+
+
+def test_a_pool_of_clones_is_read_at_one_clones_worth_of_evidence(
+    cloned_walk_result: TournamentResult,
+) -> None:
+    """The `ict` universe trials hold every trade `CLONES` times - enough to clear rule 1, which
+    one walk alone never does - and rule 2 must read them at the days they were entered on, not
+    at the row count: the deflated Sharpe comes out where one clone's own trades put it, and
+    reading the rows as independent trades would have put it somewhere else."""
+    result = cloned_walk_result
+    report = _report(result, f"{CLONES} clones of a pure random walk")
+    universe = [row for row in _pooled(result, "ict") if row["symbol"] == "*"]
+    assert len(universe) >= len(CLONE_EXITS), report  # one per exit, plus a view if one was selected
+    graded = [row for row in universe if row["g1"] is True]
+    assert graded, f"no ict universe trial cleared rule 1, so this control proves nothing\n{report}"
+    # no single walk reaches rule 1's floor, so V is never measured and the gate falls back to
+    # the analytical 1/(n - 1) - at the effective size, for a universe trial
+    assert result.trial_sr_variance is None, report
+
+    for row in graded:
+        trades = result.oos_trades[row["config_id"]]
+        one_clone = result.oos_trades[row["config_id"].replace(":*", ":WALK0")]
+        gate = result.gates[row["config_id"]]
+        assert gate.dsr is not None, report
+        assert len(trades) == CLONES * len(one_clone), report
+        assert gate.dsr.effective_n == entry_days(trades) == entry_days(one_clone), report
+
+        alone = deflated_sharpe(realized_rs(one_clone), result.n_trials, effective_n=entry_days(one_clone))
+        naive = deflated_sharpe(realized_rs(trades), result.n_trials)
+        # equal up to the Sharpe's ddof, which a cloned sample shifts by about 3%
+        assert gate.dsr.prob == pytest.approx(alone.prob, abs=0.05), report
+        assert gate.dsr.sr_star == pytest.approx(alone.sr_star), report
+        assert abs(naive.prob - alone.prob) > abs(gate.dsr.prob - alone.prob), report
+        assert gate.rule2 is False, report
