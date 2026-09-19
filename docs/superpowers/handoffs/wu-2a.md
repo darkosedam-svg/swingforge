@@ -62,3 +62,37 @@ What it costs, measured on the synthetic stores (newest-first -> walk), and acce
 
 The setups nobody planted multiply about 2.7x (289 -> 753 and 281 -> 808), which dilutes the planted store's expectancy and moves the edge/flat signal parity from 1.2% to 6.1% (the plant itself differs by 4.4%; `test_both_stores_offer_ict_the_same_entries` now allows 10%, and separately asserts that every planted setup is taken in the store it was planted in - which is not a substitute for the looser parity bound, only a guarantee that neither plant is under-sampled). In exchange the null controls have teeth: on a pure random walk ICT holds ~240 OOS trades at about zero expectancy and is rejected by the statistics, where before it never reached the trade-count floor. The real-data before/after is in the re-run section that follows.
 
+## Re-run with the candidate walk (2026-09-20)
+
+`tournament:hyperliquid:20260920`, the same store replayed on `main` at `381d6d7` (seed 0), against `tournament:hyperliquid:20260919` (newest-first scan, same gate, same pooling): 901 trials (751 per instrument and view, 150 universe), `trial_sr_variance` 0.0151, **0 passed**. Zones was not touched and its 289 rows are identical in both runs; the frequency-matched baseline follows ICT's new rate.
+
+Per instrument and config, averaged over the 16 exits (before -> after):
+
+| entry | session | avg n_is | avg n_oos | max n_oos | avg exp_oos (R) | rows clearing rule 1 |
+|---|---|---|---|---|---|---|
+| ict | none | 19.1 -> 64.9 | 12.5 -> 46.2 | 15 -> 65 | -0.14 -> -0.18 | 0 -> 12 of 80 |
+| ict | london_ny | 12.8 -> 47.9 | 7.4 -> 33.0 | 10 -> 46 | +0.10 -> -0.06 | 0 -> 0 |
+| ict | active | 7.5 -> 32.8 | 3.6 -> 22.5 | 6 -> 32 | +0.23 -> +0.09 | 0 -> 0 |
+| baseline | none | 11.9 -> 41.6 | 7.3 -> 25.5 | 14 -> 41 | +0.00 -> +0.00 | 0 -> 0 |
+
+| instrument (ict, no filter) | avg n_is | avg n_oos | max n_oos | avg exp_oos (R) |
+|---|---|---|---|---|
+| ARB | 19.0 -> 53.9 | 14.0 -> 37.8 | 14 -> 40 | +0.16 -> +0.05 |
+| BTC | 28.1 -> 67.0 | 14.0 -> 59.2 | 14 -> 65 | -0.38 -> -0.11 |
+| ETH | 13.0 -> 61.2 | 14.6 -> 51.0 | 15 -> 57 | +0.05 -> -0.33 |
+| HYPE | 13.6 -> 55.2 | 8.9 -> 29.4 | 9 -> 34 | -0.16 -> -0.24 |
+| SOL | 22.0 -> 87.1 | 11.0 -> 53.8 | 11 -> 62 | -0.38 -> -0.29 |
+
+Pooled across ARB, BTC, ETH, HYPE and SOL (the universe trials), averaged over the 16 exits:
+
+| entry | session | avg n_oos | range | avg exp_oos (R) | rows clearing rule 1 |
+|---|---|---|---|---|---|
+| ict | none | 62.6 -> 231.2 | 204-258 | -0.13 -> -0.19 | 16 -> 16 |
+| ict | london_ny | 37.0 -> 165.2 | 152-181 | +0.13 -> -0.07 | 0 -> 16 |
+| ict | active | 18.0 -> 112.4 | 106-119 | +0.19 -> +0.07 | 0 -> 16 |
+| baseline | none | 36.4 -> 127.5 | 106-141 | +0.01 -> +0.00 | 0 -> 16 |
+
+The walk did on real data what it did on the synthetic stores: ICT trades three to four times as often (the 2026-09-07 investigation had put the shadowing loss second only to the range defect). Sample size is no longer what stops any ICT arm - twelve single-instrument rows (BTC and SOL) clear rule 1 on their own, every pooled ICT row clears it on 106 to 258 trades, and on entry days too (88 to 176 distinct days on the rows the report shows, so the open decision on rule 1 in the WU-2C handoff no longer changes any ICT verdict). What stops them is the statistics: of the 306 ICT rows (per instrument, views and pooled) 64 clear rule 1, **none** clears rule 2 or rule 3, 2 clear rule 4 and 31 rule 5. The best row is `ict|trail_2_1|active|hyperliquid:*`: 110 trades on 91 entry days, +0.26R out of sample against +0.27R in sample, ahead of the pooled baseline (diff p5 +0.05R) and of buy-and-hold (MAR 1.70 against -0.30) - with a bootstrap 5th-percentile expectancy of -0.05R and a deflated-Sharpe probability that rounds to zero against 901 trials. With no session filter the best pooled expectancy is -0.005R on 204 trades.
+
+The friendlier readings of the previous run did not survive a larger sample: the London/NY arm went from +0.13R on 37 pooled trades to -0.07R on 165, the active-hours arm from +0.19R on 18 to +0.07R on 112. That is what the gate's trade-count floor exists to say, now said by the data. The one pattern left is that the four trailing exits under the active-hours filter are positive both in sample (+0.10R to +0.27R) and out of sample (+0.18R to +0.26R, on 106-111 trades); at 901 trials that is well inside what a search finds by chance, and it is the first thing a longer history should be asked about.
+
