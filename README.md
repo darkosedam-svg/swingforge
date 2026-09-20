@@ -1,6 +1,6 @@
 # swingforge
 
-A venue-agnostic swing-trading research and paper-trading system: Daily bias, 4H execution, crypto perps (Hyperliquid) and FX majors (OANDA practice). It answers one question honestly: does any of three entry families (ICT structure, supply/demand zones, or a frequency-matched random baseline) show an out-of-sample edge, and which exit rule captures it best. Backtest and paper trading share one engine, and no result exists without passing a statistical gate that accounts for the full search.
+A venue-agnostic swing-trading research and paper-trading system: Daily bias, 4H execution, crypto perps (Hyperliquid) and FX majors (OANDA practice), with OKX swaps as a research-only source of deeper crypto history. It answers one question honestly: does any of three entry families (ICT structure, supply/demand zones, or a frequency-matched random baseline) show an out-of-sample edge, and which exit rule captures it best. Backtest and paper trading share one engine, and no result exists without passing a statistical gate that accounts for the full search.
 
 Scope: research and paper trading only. Live order placement is a separate spec, gated on tournament and paper results.
 
@@ -26,7 +26,7 @@ Still human-only: OANDA credentials (cassette, backfill, tournament) and the VPS
 swingforge/
   core/         types, context (Wilder ATR/ADX), fill resolver, costs, portfolio, engine, settings
   strategies/   ict, zones, baseline, session filter, levels, the 16-variant exit grid
-  adapters/     DuckDB store, replay source, paper broker, hyperliquid/, oanda/, transient settings reader
+  adapters/     DuckDB store, replay source, paper broker, hyperliquid/, oanda/, okx/ (research only), transient settings reader
   lab/          gate (deflated Sharpe, stationary bootstrap, MAR), tournament, excursion, regime, report
   web/          FastAPI dashboard (read-mostly; one settings write route)
   cli.py        backfill, tournament, paper, web, report
@@ -58,13 +58,14 @@ Copy `.env.example` to `.env` and fill in `OANDA_TOKEN`, `OANDA_ACCOUNT_ID` (pra
 ```bash
 swingforge backfill --venue hyperliquid --years 4 --data-dir data
 swingforge backfill --venue oanda --years 4 --data-dir data
+swingforge backfill --venue okx --years 4 --data-dir data          # research only: history, no paper
 swingforge tournament --venue hyperliquid --out reports --data-dir data
 swingforge report --venue hyperliquid --run-id <printed run id> --data-dir data
 swingforge paper --venue hyperliquid --config "ict|fixed_r_2|london_ny|hyperliquid:BTC" --data-dir data
 swingforge web --host 127.0.0.1 --port 8787 --data-dir data
 ```
 
-One DuckDB file per venue lives under `--data-dir` (env `SWINGFORGE_DATA_DIR`). The tournament prints its run id and the passing config ids; `--run-id` fixes the id (required with `--resume`), and `--instruments`, `--entries`, `--exits`, `--sessions`, `--start`, `--end` narrow a run. Paper never trades a `baseline` config.
+One DuckDB file per venue lives under `--data-dir` (env `SWINGFORGE_DATA_DIR`). `okx` works with `backfill`, `tournament` and `report` and is refused by `paper`. The tournament prints its run id and the passing config ids; `--run-id` fixes the id (required with `--resume`), and `--instruments`, `--entries`, `--exits`, `--sessions`, `--start`, `--end` narrow a run. Paper never trades a `baseline` config.
 
 ## How the tournament works
 
@@ -87,6 +88,7 @@ Each is recorded in the relevant handoff note under `docs/superpowers/handoffs/`
 - The dashboard may import `adapters.store` (for the atomic settings write); it still cannot import strategies, venue adapters, replay or paper code.
 - Rule 2's cross-trial Sharpe variance is taken over trials with at least 60 pooled out-of-sample trades (rule 1's floor). Shorter trials have unbounded per-trade Sharpe estimates, and on the first real Hyperliquid sweep four-trade trials set the variance to 2,721, which no strategy could clear. The trial count still includes every trial.
 - The spec grades one instrument at a time, and one instrument does not reach rule 1's 60 out-of-sample trades in the history a venue serves. The tournament therefore also grades pooled `venue:*` trials (above). A pooled pass is a verdict on the instruments traded together; `swingforge paper` refuses a `venue:*` id and the config is enabled one instrument at a time.
+- A third venue the spec does not have: OKX USDT swaps, research only. Hyperliquid's 27 months leave 15 out of sample, too few to tell a small edge from a search artefact; OKX serves 4H candles back to listing, so the same tournament runs over four years there, in its own store, never spliced into Hyperliquid's. Its public API serves only about three months of funding, so older settlements are charged the venue's 0.01%-per-8h baseline - an assumption rule 6 does not stress, so an OKX result that holds by less than about 0.1R per trade is unresolved; and it replays with 1H sub-bars throughout where Hyperliquid mostly cannot, so the two venues' results are compared with care, not like for like. `Instrument.venue` gained `"okx"` (contract v3).
 - Hyperliquid serves only its newest 5,000 candles per interval, so a backfill holds about 27 months of 4H bars and 7 months of 1H bars however many years are requested; funding history is paged and complete.
 
 ## Deployment

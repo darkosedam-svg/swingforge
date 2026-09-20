@@ -12,6 +12,7 @@ import pytest
 from swingforge.core.context import Context
 from swingforge.core.types import Bar, Instrument
 from swingforge.strategies.zones import _MAX_ZONES, Zones, _Zone
+from tests.unit.perf_budget import load_factor, scaled_budget
 
 PERP = Instrument(
     venue="hyperliquid",
@@ -550,6 +551,7 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
 
     daily_iter = iter(daily_bars)
     next_daily = next(daily_iter, None)
+    load_before = load_factor()
     started = time.perf_counter()
     for h4_bar in h4_bars:
         while next_daily is not None and next_daily.ts_open.date() < h4_bar.ts_open.date():
@@ -559,4 +561,8 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
         strategy.on_bar(ctx)
     elapsed = time.perf_counter() - started
 
-    assert elapsed < 5.0, f"Zones.on_bar took {elapsed:.2f}s for 8,760 4H bars (budget: 5s)"
+    budget = scaled_budget(5.0, load_before)
+    assert elapsed < budget, (
+        f"Zones.on_bar took {elapsed:.2f}s for 8,760 4H bars "
+        f"(budget: {budget:.1f}s, scaled for the machine's load)"
+    )

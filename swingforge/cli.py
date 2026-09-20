@@ -2,6 +2,8 @@
 
 Wires the real venue adapters, strategies, exit rules, tournament, paper engine and
 dashboard together into five commands: `backfill`, `tournament`, `paper`, `web`, `report`.
+Three venues: `hyperliquid` and `oanda` trade paper; `okx` is research-only (history for
+`backfill`/`tournament`/`report`, refused by `paper`).
 `swingforge.cli` sits outside the package's import layers (`.importlinter`) and may import
 anything -- everything else in the codebase only ever sees this module wire it together.
 
@@ -22,6 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -34,6 +37,8 @@ from swingforge.adapters.hyperliquid.bars import HyperliquidBars, hl_instruments
 from swingforge.adapters.hyperliquid.costs import HyperliquidCosts, load_funding
 from swingforge.adapters.oanda.bars import ApiLike, OandaBars, oanda_instrument
 from swingforge.adapters.oanda.costs import OandaCosts, load_financing
+from swingforge.adapters.okx import OkxBars, OkxCosts, inst_id, okx_instruments
+from swingforge.adapters.okx import load_funding as load_okx_funding
 from swingforge.adapters.paper import FillLog, PaperBroker
 from swingforge.adapters.settings_reader import TransientSettingsReader
 from swingforge.adapters.store import Store
@@ -71,15 +76,28 @@ class Venue(StrEnum):
 
     HYPERLIQUID = "hyperliquid"
     OANDA = "oanda"
+    OKX = "okx"
 
 
 _VENUES: tuple[str, ...] = tuple(v.value for v in Venue)
+_RESEARCH_ONLY_VENUES: frozenset[str] = frozenset({"okx"})
+"""Venues that serve history for the tournament and nothing live: `paper` refuses them."""
+_GAPLESS_VENUES: frozenset[str] = frozenset({"okx"})
+"""Venues that have never omitted a candle (swaps trading around the clock, checked over four
+years): a hole between two windows of a backfill is an anomaly there, and is refused. Not
+Hyperliquid, whose history has not been audited for it, and never OANDA, where the weekend is
+a gap by design."""
+_MAX_CONSECUTIVE_BACKFILL_FAILURES = 3
+"""Refused series in a row before `backfill` gives up on the whole run: one is a bad series,
+three in a row is a venue that is down or blocking, and each costs a full retry ladder (about
+a minute) to find out."""
 _OANDA_SIX: tuple[str, ...] = ("EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY", "XAU_USD")
 
 _YEAR = timedelta(days=365)
 _ONE_DAY = timedelta(hours=24)
 _FOUR_HOURS = timedelta(hours=4)
 _TFS: tuple[TF, ...] = ("1h", "4h", "1d")
+_TF_SPAN: dict[str, timedelta] = {"1h": timedelta(hours=1), "4h": _FOUR_HOURS, "1d": _ONE_DAY}
 _WARMUP_DAILY_BARS = 60
 _WARMUP_4H_BARS = 200
 _DEFAULT_INITIAL_EQUITY = 10_000.0
@@ -120,7 +138,7 @@ def _existing_store_path(data_dir: str, venue: str) -> Path:
 # --- venue wiring: bar sources, instrument lists, cost models -----------------------
 
 
-def _bar_source(venue: str, *, poll_delay_s: float = 5.0) -> HyperliquidBars | OandaBars:
+def _bar_source(venue: str, *, poll_delay_s: float = 5.0) -> HyperliquidBars | OandaBars | OkxBars:
     """The real `BarSource` for `venue`. A small factory so tests can monkeypatch it."""
     if venue == "hyperliquid":
         return HyperliquidBars(poll_delay_s=poll_delay_s)
@@ -131,10 +149,14 @@ def _bar_source(venue: str, *, poll_delay_s: float = 5.0) -> HyperliquidBars | O
             environment=os.environ.get("OANDA_ENV", "practice"),
             poll_delay_s=poll_delay_s,
         )
+    if venue == "okx":
+        return OkxBars()
     raise ValueError(f"unknown venue {venue!r}: expected one of {_VENUES}")
 
 
-def _instruments(venue: str, source: HyperliquidBars | OandaBars, override: str | None) -> list[Instrument]:
+def _instruments(
+    venue: str, source: HyperliquidBars | OandaBars | OkxBars, override: str | None
+) -> list[Instrument]:
     """The instruments to backfill/trade: `--instruments` overrides the venue's own list."""
     symbols = _split(override) if override else None
     if venue == "hyperliquid":
@@ -147,6 +169,9 @@ def _instruments(venue: str, source: HyperliquidBars | OandaBars, override: str 
     if venue == "oanda":
         names = symbols if symbols is not None else list(_OANDA_SIX)
         return [oanda_instrument(name) for name in names]
+    if venue == "okx":
+        assert isinstance(source, OkxBars)
+        return okx_instruments(source.client, symbols) if symbols else okx_instruments(source.client)
     raise ValueError(f"unknown venue {venue!r}: expected one of {_VENUES}")
 
 
@@ -186,16 +211,21 @@ def _oanda_api(token: str | None, environment: str) -> ApiLike:
 
 
 def _build_cost_model(venue: str, store: Store, instruments: Sequence[Instrument]) -> Any:
-    """The real cost model for `venue`: per-instrument Hyperliquid funding, or OANDA swap.
+    """The real cost model for `venue`: per-instrument funding (Hyperliquid, OKX), or OANDA swap.
 
     Hyperliquid: one `HyperliquidCosts` per instrument, loaded with that instrument's own
     funding history from the store, dispatched by `PerInstrumentCostModel`.
+
+    OKX: one `OkxCosts` per instrument, loaded with whatever funding the store holds for it -
+    the venue serves only its last three months, and `OkxCosts` charges its baseline rate for
+    every settlement older than that.
 
     OANDA: `OandaCosts(financing={})` (swap always 0) unless `OANDA_ACCOUNT_ID`/`OANDA_TOKEN`
     are both set in the environment, in which case each instrument's financing is fetched
     live via `load_financing`.
     """
-    if venue == "hyperliquid":
+    if venue in ("hyperliquid", "okx"):
+        costs_cls = HyperliquidCosts if venue == "hyperliquid" else OkxCosts
         models: dict[str, Any] = {}
         for instrument in instruments:
             bar_range = store.bar_range(instrument, "4h")
@@ -203,7 +233,7 @@ def _build_cost_model(venue: str, store: Store, instruments: Sequence[Instrument
             if bar_range is not None:
                 first, last, _count = bar_range
                 funding_rows = store.funding(instrument, first, last + _FOUR_HOURS)
-            models[instrument_key(instrument)] = HyperliquidCosts(funding=funding_rows)
+            models[instrument_key(instrument)] = costs_cls(funding=funding_rows)
         return PerInstrumentCostModel(models)
     if venue == "oanda":
         account_id = os.environ.get("OANDA_ACCOUNT_ID")
@@ -251,20 +281,56 @@ def _windows(start: datetime, end: datetime, span: timedelta) -> list[tuple[date
 
 def _funding(
     venue: str,
-    source: HyperliquidBars | OandaBars,
+    source: HyperliquidBars | OandaBars | OkxBars,
     instrument: Instrument,
     start: datetime,
     end: datetime,
 ) -> list[tuple[datetime, float]]:
-    """Funding-rate history for `instrument` over `[start, end)`; always empty for OANDA.
+    """Funding-rate history for `instrument` over `[start, end)`; always empty for OANDA, and
+    for OKX only the three months or so the venue still serves.
 
     A small factory, like `_bar_source`/`_instruments`, so tests can monkeypatch it instead
     of needing a real `HyperliquidBars` behind the fake source `backfill`'s test drives.
     """
+    if venue == "okx":
+        assert isinstance(source, OkxBars)
+        return load_okx_funding(source.client, inst_id(instrument), start, end)
     if venue != "hyperliquid":
         return []
     assert isinstance(source, HyperliquidBars)
     return load_funding(source._get_info(), instrument.symbol, start, end)
+
+
+def _backfill_timeframe(
+    venue: str,
+    source: HyperliquidBars | OandaBars | OkxBars,
+    store: Store,
+    instrument: Instrument,
+    tf: TF,
+    start: datetime,
+    end: datetime,
+) -> int:
+    """Backfill one timeframe a year-long window at a time; returns the bars written.
+
+    On a `_GAPLESS_VENUES` venue the seam between two windows is checked too: the source
+    validates each series it returns, and a hole exactly between two of them is only visible
+    from here. The window before the hole stays stored; the one after it is not written.
+    """
+    total = 0
+    previous: Bar | None = None
+    for window_start, window_end in _windows(start, end, _YEAR):
+        bars = source.history(instrument, tf, window_start, window_end)
+        if venue in _GAPLESS_VENUES and previous is not None and bars:
+            seam = bars[0].ts_open - previous.ts_open
+            if seam != _TF_SPAN[tf]:
+                raise RuntimeError(
+                    f"gap across a backfill window: {previous.ts_open.isoformat()} is followed by "
+                    f"{bars[0].ts_open.isoformat()}"
+                )
+        total += store.upsert_bars(bars)
+        if bars:
+            previous = bars[-1]
+    return total
 
 
 def _backfill(venue: str, years: int, instruments_opt: str | None, data_dir: str) -> None:
@@ -280,39 +346,70 @@ def _backfill(venue: str, years: int, instruments_opt: str | None, data_dir: str
 
     # ⚠ The store is opened once for the whole backfill; no other process should write to
     # the same file while this runs (DuckDB allows only one read-write connection at a time).
+    # One refused series (a gap, a malformed row, a venue error that outlasted its retries)
+    # must not cost the other instruments their backfill, nor pass unnoticed: it is echoed,
+    # the run carries on, and the command exits non-zero at the end. Three in a row is a
+    # venue that is down, not a bad series, and ends the run.
+    failures: list[str] = []
+    consecutive = 0
+
+    def attempt(label: str, step: Callable[[], int]) -> int:
+        nonlocal consecutive
+        try:
+            written = step()
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+            typer.echo(f"  {label}: FAILED - {exc}", err=True)
+            consecutive += 1
+            if consecutive >= _MAX_CONSECUTIVE_BACKFILL_FAILURES:
+                raise RuntimeError(
+                    f"backfill aborted after {consecutive} failures in a row; the last: {failures[-1]}"
+                ) from exc
+            return 0
+        consecutive = 0
+        return written
+
+    def funding_step(instrument: Instrument) -> int:
+        # Incremental: funding is append-only per settlement, so resume from the last stored
+        # one (re-fetching that one row is an idempotent upsert) instead of paging the whole
+        # span again on every nightly run.
+        stored_funding = store.funding(instrument, start, now)
+        funding_start = stored_funding[-1][0] if stored_funding else start
+        rows = _funding(venue, source, instrument, funding_start, now)
+        store.upsert_funding(instrument, rows)
+        return len(rows)
+
     with Store(store_path) as store:
         store.upsert_instruments(instruments)
         for instrument in instruments:
+            key = instrument_key(instrument)
             counts: dict[str, int] = {}
             for tf in _TFS:
-                total = 0
-                for window_start, window_end in _windows(start, now, _YEAR):
-                    bars = source.history(instrument, tf, window_start, window_end)
-                    total += store.upsert_bars(bars)
-                counts[tf] = total
-            # Incremental: funding is append-only per hour, so resume from the last stored
-            # settlement (re-fetching that one row is an idempotent upsert) instead of paging
-            # the whole span again on every nightly run.
-            stored_funding = store.funding(instrument, start, now)
-            funding_start = stored_funding[-1][0] if stored_funding else start
-            store.upsert_funding(instrument, _funding(venue, source, instrument, funding_start, now))
+                counts[tf] = attempt(
+                    f"{key} {tf}",
+                    partial(_backfill_timeframe, venue, source, store, instrument, tf, start, now),
+                )
+            attempt(f"{key} funding", partial(funding_step, instrument))
             bar_range = store.bar_range(instrument, "4h")
             months = 0.0 if bar_range is None else months_between(bar_range[0], bar_range[1] + _FOUR_HOURS)
             typer.echo(
                 f"  {instrument_key(instrument):<20} 1h={counts['1h']:<8} 4h={counts['4h']:<8} "
                 f"1d={counts['1d']:<8} months={months:.1f}"
             )
+    if failures:
+        noun = "failure" if len(failures) == 1 else "failures"
+        _fail(f"backfill finished with {len(failures)} {noun}: {'; '.join(failures)}"[:600])
     typer.echo("backfill complete")
 
 
 @app.command()
 def backfill(
-    venue: Venue = typer.Option(..., "--venue", help="hyperliquid or oanda"),  # noqa: B008
+    venue: Venue = typer.Option(..., "--venue", help="hyperliquid, oanda or okx"),  # noqa: B008
     years: int = typer.Option(..., "--years", min=1),  # noqa: B008
     instruments: str | None = typer.Option(None, "--instruments", help="comma-separated symbols"),  # noqa: B008
     data_dir: str = typer.Option("data", "--data-dir", envvar="SWINGFORGE_DATA_DIR"),  # noqa: B008
 ) -> None:
-    """Backfill 1h/4h/1d bars (and Hyperliquid funding) for every traded instrument."""
+    """Backfill 1h/4h/1d bars (and Hyperliquid/OKX funding) for every traded instrument."""
     try:
         _backfill(venue.value, years, instruments, data_dir)
     except typer.Exit:
@@ -666,6 +763,11 @@ async def _build_paper_runtime(
     `realized_r = 0.0`, `regime` unchanged) and echoes which trade it closed, rather than
     silently guessing either way.
     """
+    if venue in _RESEARCH_ONLY_VENUES:
+        _fail(
+            f"{venue} is a research-only venue: it serves history for the tournament, not a live stream",
+            code=2,
+        )
     entry, exit_name, session, inst_key = _parse_config_id(config_id)
     if entry == "baseline":
         _fail("baseline is the control and never trades paper", code=2)
@@ -695,6 +797,8 @@ async def _build_paper_runtime(
     initial_equity = equity_rows[-1][1] if equity_rows else _DEFAULT_INITIAL_EQUITY
 
     source = _bar_source(venue, poll_delay_s=poll_delay)
+    # type narrowing only: the refusal of a research-only venue is the `_fail` above
+    assert not isinstance(source, OkxBars)
     broker = PaperBroker(cost_model, FillResolver())
     portfolio = Portfolio(initial_equity)
     strategy = _entry_factory(entry, instrument, baseline_rate=None, seed=0)
@@ -784,7 +888,7 @@ async def _paper(
 
 @app.command()
 def paper(
-    venue: Venue = typer.Option(..., "--venue"),  # noqa: B008
+    venue: Venue = typer.Option(..., "--venue", help="hyperliquid or oanda (okx is research-only)"),  # noqa: B008
     config: str = typer.Option(..., "--config", help="entry|exit|session|venue:symbol"),  # noqa: B008
     poll_delay: float = typer.Option(5.0, "--poll-delay"),  # noqa: B008
     abandon_open_trade: bool = typer.Option(  # noqa: B008
@@ -818,7 +922,8 @@ def web(
     port: int = typer.Option(8787, "--port"),  # noqa: B008
     data_dir: str = typer.Option("data", "--data-dir", envvar="SWINGFORGE_DATA_DIR"),  # noqa: B008
 ) -> None:
-    """Serve the read/write dashboard over every present venue store under `data_dir`."""
+    """Serve the read/write dashboard over every present paper-trading venue store under `data_dir`
+    (a research-only venue's store is not shown)."""
     token = os.environ.get("SWINGFORGE_TOKEN") or None
     if host not in _LOOPBACK_HOSTS and not token:
         _fail(f"--host {host} requires SWINGFORGE_TOKEN to be set", code=2)

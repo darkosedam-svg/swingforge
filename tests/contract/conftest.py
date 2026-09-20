@@ -23,12 +23,27 @@ CASSETTE_DIR = Path(__file__).parent / "cassettes"
 _RECORD_MODE = "once" if os.environ.get("SWINGFORGE_RECORD") else "none"
 
 
+_DROPPED_RESPONSE_HEADERS = {"set-cookie", "cf-ray", "x-brokerid", "report-to", "nel"}
+
+
+def _without_cookies(response: dict) -> dict:
+    """Keep a venue's cookies and request ids out of a cassette. Anonymous bot-management
+    cookies on the public venues; on a credentialed one a session cookie would be a secret."""
+    response["headers"] = {
+        name: value
+        for name, value in response["headers"].items()
+        if name.lower() not in _DROPPED_RESPONSE_HEADERS
+    }
+    return response
+
+
 @pytest.fixture
 def vcr() -> vcrpy.VCR:
     """A `VCR` instance configured per the design spec: no secrets ever hit a cassette."""
     return vcrpy.VCR(
         record_mode=_RECORD_MODE,
-        filter_headers=["Authorization"],
+        filter_headers=["Authorization", "Cookie"],
+        before_record_response=_without_cookies,
         cassette_library_dir=str(CASSETTE_DIR),
     )
 

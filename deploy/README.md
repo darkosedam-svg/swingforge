@@ -176,6 +176,34 @@ an `OnFailure=<your-alerting-unit>.service` line to `swingforge-backfill.service
 `[Unit]` section (not shipped here - there is no alerting unit in this repo to point it
 at).
 
+### Optional: deeper crypto history from OKX (research only)
+
+Hyperliquid's 27 months leave 15 months out of sample. `--venue okx` backfills OKX's USDT
+swaps (BTC, ETH, SOL, ARB, HYPE by default) from public endpoints - no key, no account -
+into its own store, `okx.duckdb`, and `tournament`/`report --venue okx` then work as for any
+venue:
+
+```bash
+/opt/swingforge/.venv/bin/swingforge backfill --venue okx --years 4
+```
+
+It is some eight hundred paged requests (about seven minutes), paced and retried, and it
+refuses a series with a gap rather than store it. If that ever fires (it cannot on the
+venue's history to date), the run carries on with everything else and exits non-zero
+naming the instrument, timeframe and the two timestamps around the hole: look at the venue's
+status page for that date, and re-run with `--instruments` for the affected coin once the
+venue has back-filled the candle - a re-run is idempotent. A long run of `FAILED` lines that
+each take a minute is the venue blocking or down, not bad data; the run stops after three. The venue is **research only**:
+`paper --venue okx` is refused, there is no systemd unit or nightly backfill for it, and the
+dashboard does not show it. Two caveats to carry into any reading of its results (both in
+`docs/superpowers/handoffs/wu-okx.md`):
+- OKX serves only about three months of funding history, so every older settlement is
+  charged a flat 0.01% per eight hours. Rule 6's cost stress does not cover that
+  assumption; treat a result that holds by less than about 0.1R per trade as unresolved.
+- OKX replays with 1H sub-bars throughout, Hyperliquid mostly without (it keeps ~7 months
+  of 1H), so the same config is graded more kindly here on trailing and partial exits.
+  Check `Fill resolution mode` in both reports before comparing across venues.
+
 ## 5. Tournament
 
 Stop paper for both venues first, and take the same `.venue.lock` the nightly backfill

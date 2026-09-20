@@ -74,7 +74,7 @@ class Instrument(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    venue: Literal["hyperliquid", "oanda"]
+    venue: Literal["hyperliquid", "oanda", "okx"]
     symbol: str
     tick_size: Decimal
     contract_multiplier: Decimal

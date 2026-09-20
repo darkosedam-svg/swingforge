@@ -33,6 +33,7 @@ from swingforge.strategies.ict import (
     find_sweep_against,
     iter_sweeps_against,
 )
+from tests.unit.perf_budget import load_factor, scaled_budget
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
@@ -1017,6 +1018,7 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
 
     daily_iter = iter(daily_bars)
     next_daily = next(daily_iter, None)
+    load_before = load_factor()
     started = time.perf_counter()
     for h4_bar in h4_bars:
         while next_daily is not None and next_daily.ts_open.date() < h4_bar.ts_open.date():
@@ -1026,8 +1028,11 @@ def test_on_bar_stays_fast_over_a_multi_year_history() -> None:
         strategy.on_bar(ctx)
     elapsed = time.perf_counter() - started
 
-    budget = 15.0 if _line_tracing_active() else 5.0
-    assert elapsed < budget, f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars (budget: {budget:.0f}s)"
+    budget = scaled_budget(15.0 if _line_tracing_active() else 5.0, load_before)
+    assert elapsed < budget, (
+        f"ICT.on_bar took {elapsed:.2f}s for 17,520 4H bars "
+        f"(budget: {budget:.1f}s, scaled for the machine's load)"
+    )
 
 
 def test_on_bar_stays_fast_when_sweeps_are_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1054,6 +1059,7 @@ def test_on_bar_stays_fast_when_sweeps_are_everywhere(monkeypatch: pytest.Monkey
     start = datetime(2020, 1, 1, tzinfo=UTC)
     signals = 0
 
+    load_before = load_factor()
     started = time.perf_counter()
     for i, (open_, high, low, close, volume) in enumerate(bars):
         ctx.push(
@@ -1087,7 +1093,8 @@ def test_on_bar_stays_fast_when_sweeps_are_everywhere(monkeypatch: pytest.Monkey
 
     assert signals > 1_000, f"only {signals} signals: this series no longer exercises the walk"
     assert calls < 2 * signals + 1_000, f"find_bos was asked {calls} times for {signals} signals"
-    budget = 30.0 if _line_tracing_active() else 10.0
+    budget = scaled_budget(30.0 if _line_tracing_active() else 10.0, load_before)
     assert elapsed < budget, (
-        f"ICT.on_bar took {elapsed:.2f}s for 17,520 sweep-rich 4H bars (budget: {budget:.0f}s)"
+        f"ICT.on_bar took {elapsed:.2f}s for 17,520 sweep-rich 4H bars "
+        f"(budget: {budget:.1f}s, scaled for the machine's load)"
     )

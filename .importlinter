@@ -64,6 +64,7 @@ source_modules =
 forbidden_modules =
     swingforge.adapters.hyperliquid
     swingforge.adapters.oanda
+    swingforge.adapters.okx
     swingforge.web
     hyperliquid
     oandapyV20
@@ -77,6 +78,7 @@ forbidden_modules =
     swingforge.strategies
     swingforge.adapters.hyperliquid
     swingforge.adapters.oanda
+    swingforge.adapters.okx
     swingforge.adapters.replay
     swingforge.adapters.paper
     hyperliquid

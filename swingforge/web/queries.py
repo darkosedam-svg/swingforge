@@ -43,7 +43,10 @@ __all__ = [
 ]
 
 VENUES: tuple[str, ...] = ("hyperliquid", "oanda")
-"""Every venue the dashboard knows how to look for. Order is the response iteration order."""
+"""Every venue the dashboard knows how to look for. Order is the response iteration order.
+
+Paper-trading venues only, on purpose: `okx` is research-only (WU-OKX handoff), and listing it
+here would let one of its runs displace the traded venue's as "latest tournament"."""
 
 _BAR_SPAN_4H = timedelta(hours=4)
 

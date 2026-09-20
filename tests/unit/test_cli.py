@@ -22,6 +22,7 @@ from swingforge import cli
 from swingforge.adapters.hyperliquid.bars import DEFAULT_PERPS, HyperliquidBars
 from swingforge.adapters.oanda.bars import OandaBars
 from swingforge.adapters.oanda.costs import OandaCosts
+from swingforge.adapters.okx import DEFAULT_FUNDING_RATE, OkxBars, OkxCosts
 from swingforge.adapters.paper import PaperBroker
 from swingforge.adapters.settings_reader import TransientSettingsReader
 from swingforge.adapters.store import Store
@@ -407,6 +408,7 @@ def test_bar_source_builds_the_right_class(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.delenv("OANDA_TOKEN", raising=False)
     assert isinstance(cli._bar_source("hyperliquid"), HyperliquidBars)
     assert isinstance(cli._bar_source("oanda"), OandaBars)
+    assert isinstance(cli._bar_source("okx"), OkxBars)
     with pytest.raises(ValueError, match="unknown venue"):
         cli._bar_source("bogus")
 
@@ -474,6 +476,61 @@ def test_funding_hyperliquid_loads_from_info() -> None:
     source = HyperliquidBars(info=_FakeHLInfo())
     rows = cli._funding("hyperliquid", source, BTC, TS0, TS0 + timedelta(days=1))
     assert rows == [(datetime.fromtimestamp(1_699_999_200, tz=UTC), 0.0001)]
+
+
+class _FakeOkxClient:
+    """The three public endpoints, canned: one funding settlement, a 0.1 tick for everything."""
+
+    def history_candles(self, inst, bar, *, after_ms=None, limit=300):  # type: ignore[no-untyped-def]
+        return []
+
+    def funding_rate_history(self, inst, *, after_ms=None, limit=100):  # type: ignore[no-untyped-def]
+        return [{"instId": inst, "fundingTime": "1700000000000", "fundingRate": "0.0002", "realizedRate": ""}]
+
+    def instrument(self, inst):  # type: ignore[no-untyped-def]
+        return {"instId": inst, "tickSz": "0.1", "ctVal": "0.01", "settleCcy": "USDT", "state": "live"}
+
+
+OKX_BTC = BTC.model_copy(update={"venue": "okx", "tick_size": Decimal("0.1"), "quote_ccy": "USDT"})
+
+
+def test_instruments_okx_default_to_the_hyperliquid_five_and_honour_the_override() -> None:
+    source = OkxBars(_FakeOkxClient())
+    assert [i.symbol for i in cli._instruments("okx", source, None)] == ["BTC", "ETH", "SOL", "ARB", "HYPE"]
+    (only,) = cli._instruments("okx", source, "BTC")
+    assert only == OKX_BTC
+
+
+def test_funding_okx_loads_what_the_venue_still_serves() -> None:
+    source = OkxBars(_FakeOkxClient())
+    settled = datetime.fromtimestamp(1_700_000_000, tz=UTC).replace(minute=0, second=0)
+    rows = cli._funding("okx", source, OKX_BTC, settled - timedelta(days=1), settled + timedelta(days=1))
+    assert rows == [(settled, 0.0002)]
+
+
+def test_build_cost_model_okx_charges_stored_funding_and_the_baseline_before_it() -> None:
+    store = Store(":memory:")
+    try:
+        store.upsert_instruments([OKX_BTC])
+        store.upsert_bars([_bar(TS0, instrument=OKX_BTC)])
+        store.upsert_funding(OKX_BTC, [(TS0, 0.0007)])  # inside the stored 4H range, which is what is read
+        model = cli._build_cost_model("okx", store, [OKX_BTC])
+        assert isinstance(model, PerInstrumentCostModel)
+        costs = model._for(OKX_BTC)
+        assert isinstance(costs, OkxCosts)
+        assert costs._rate_at(TS0 + timedelta(hours=8)) == 0.0007  # from the store
+        assert costs._rate_at(TS0 - timedelta(days=400)) == DEFAULT_FUNDING_RATE  # older than any record
+    finally:
+        store.close()
+
+
+def test_paper_refuses_the_research_only_venue(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        ["paper", "--venue", "okx", "--config", "ict|fixed_r_2|none|okx:BTC", "--data-dir", str(tmp_path)],
+    )
+    assert result.exit_code == 2, result.output
+    assert "research-only" in result.output
 
 
 def test_build_cost_model_hyperliquid_is_per_instrument_dispatcher() -> None:
@@ -690,6 +747,88 @@ def test_backfill_instruments_override_is_forwarded(monkeypatch: pytest.MonkeyPa
     )
     assert result.exit_code == 0, result.output
     assert captured["override"] == "BTC"
+
+
+class _FlakyBackfillSource(_FakeBackfillSource):
+    """Fails one instrument's one timeframe, the way a refused series (a gap, a malformed row) does."""
+
+    def __init__(self, bars_by_tf: dict[str, list[Bar]], *, fail: tuple[str, str]) -> None:
+        super().__init__(bars_by_tf)
+        self._fail = fail
+
+    def history(self, instrument: Instrument, tf: str, start: datetime, end: datetime) -> list[Bar]:
+        if (instrument.symbol, tf) == self._fail:
+            raise RuntimeError(f"history for {instrument.symbol} {tf} has a gap")
+        return [
+            bar.model_copy(update={"instrument": instrument})
+            for bar in super().history(instrument, tf, start, end)
+        ]
+
+
+def test_backfill_survives_one_refused_series_and_still_exits_non_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A refused series must not cost the other instruments their backfill - nor go unnoticed:
+    everything else is stored, the failure is named, and the exit code says the run was not clean."""
+    eth = BTC.model_copy(update={"symbol": "ETH"})
+    bars_by_tf = _synthetic_bars_by_tf(BTC, start=datetime(2024, 1, 1, tzinfo=UTC), months=2, seed=1)
+    source = _FlakyBackfillSource(bars_by_tf, fail=("BTC", "4h"))
+    monkeypatch.setattr(cli, "_bar_source", lambda venue, **kw: source)
+    monkeypatch.setattr(cli, "_instruments", lambda venue, src, override: [BTC, eth])
+    monkeypatch.setattr(cli, "_funding", lambda venue, src, instrument, start, end: [])
+
+    data_dir = tmp_path / "data"
+    result = runner.invoke(
+        app, ["backfill", "--venue", "hyperliquid", "--years", "1", "--data-dir", str(data_dir)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "hyperliquid:BTC 4h" in result.output and "has a gap" in result.output
+    assert "1 failure" in result.output
+    store = Store(data_dir / "hyperliquid.duckdb", read_only=True)
+    try:
+        assert store.bar_range(BTC, "4h") is None  # the refused series was not stored
+        assert store.bar_range(BTC, "1h") is not None and store.bar_range(BTC, "1d") is not None
+        assert store.bar_range(eth, "4h") is not None  # and the next instrument was not skipped
+    finally:
+        store.close()
+
+
+def test_backfill_refuses_a_gap_across_a_window_seam_on_a_gapless_venue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`OkxBars.history` checks each series it returns, and `backfill` asks for a year at a time:
+    a hole exactly at the seam between two windows is only visible from here."""
+    okx_btc = BTC.model_copy(update={"venue": "okx"})
+    first_window = [_bar(TS0 + timedelta(hours=4 * i), instrument=okx_btc) for i in range(3)]
+    seam_hole = [_bar(TS0 + timedelta(hours=4 * i), instrument=okx_btc) for i in range(4, 7)]  # bar 3 missing
+
+    class TwoWindows:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def history(self, instrument: Instrument, tf: str, start: datetime, end: datetime) -> list[Bar]:
+            if tf != "4h":
+                return []
+            self.calls += 1
+            return first_window if self.calls == 1 else seam_hole
+
+    monkeypatch.setattr(cli, "_bar_source", lambda venue, **kw: TwoWindows())
+    monkeypatch.setattr(cli, "_instruments", lambda venue, src, override: [okx_btc])
+    monkeypatch.setattr(cli, "_funding", lambda venue, src, instrument, start, end: [])
+
+    data_dir = tmp_path / "data"
+    result = runner.invoke(app, ["backfill", "--venue", "okx", "--years", "2", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "okx:BTC 4h" in result.output and "gap" in result.output
+    store = Store(data_dir / "okx.duckdb", read_only=True)
+    try:
+        assert (
+            store.bar_range(okx_btc, "4h")[2] == 3
+        )  # the window before the hole is kept, the one after is not
+    finally:
+        store.close()
 
 
 def test_backfill_rejects_an_unknown_venue() -> None:

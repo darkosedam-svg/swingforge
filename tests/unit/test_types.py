@@ -80,8 +80,17 @@ def fill(**overrides: object) -> Fill:
     return Fill(**kwargs)  # type: ignore[arg-type]
 
 
-def test_contract_version_is_two() -> None:
-    assert CONTRACT_VERSION == 2
+def test_contract_version_is_three() -> None:
+    # v3 (2026-09-20): `Instrument.venue` admits "okx", the research-only venue.
+    assert CONTRACT_VERSION == 3
+
+
+def test_instrument_venue_is_a_closed_set() -> None:
+    base = {"symbol": "BTC", "tick_size": Decimal("0.1"), "contract_multiplier": Decimal("1")}
+    for venue in ("hyperliquid", "oanda", "okx"):
+        Instrument(venue=venue, quote_ccy="USD", session_profile="perp", **base)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        Instrument(venue="binance", quote_ccy="USD", session_profile="perp", **base)  # type: ignore[arg-type]
 
 
 # --- Signal ----------------------------------------------------------------
